@@ -29,6 +29,8 @@ from paper_trading.portfolio import (
     compute_positions,
     realized_pnl,
     trades_to_df,
+    turnover_total,
+    monthly_performance,
 )
 from paper_trading.store import (
     connect,
@@ -352,6 +354,23 @@ def page_dashboard(conn, starting: float, trades_df: pd.DataFrame) -> None:
     _pnl_metric(c6, "Realized P&L (closed)", realized)
     c7.metric("Open positions", str(len(positions)))
 
+    # Turnover and monthly performance
+    if not trades_df.empty:
+        t_total = turnover_total(trades_df)
+        # compute monthly series using live LTP lookup when available
+        monthly_df = monthly_performance(trades_df, starting, ltp_lookup=lambda s: fetch_ltp(s))
+    else:
+        t_total = 0.0
+        monthly_df = pd.DataFrame()
+
+    c8, c9 = st.columns(2)
+    c8.metric("Total turnover", _fmt_inr(t_total))
+    if not monthly_df.empty:
+        last_month = monthly_df.iloc[-1]
+        c9.metric("Last month return", f"{last_month['monthly_return_pct']:+.2f}%")
+    else:
+        c9.metric("Monthly return", "N/A")
+
     if positions and live_quote_count < len(positions):
         st.warning(
             f"Live LTP for {live_quote_count}/{len(positions)} positions — "
@@ -367,6 +386,15 @@ def page_dashboard(conn, starting: float, trades_df: pd.DataFrame) -> None:
         )
     else:
         st.info("No open positions. Place a BUY from the **New trade** tab.")
+
+    # show monthly table and simple plot
+    if not monthly_df.empty:
+        st.subheader("Monthly performance & turnover")
+        st.dataframe(monthly_df, use_container_width=True)
+        try:
+            st.line_chart(monthly_df['end_equity'])
+        except Exception:
+            pass
 
 
 def page_new_trade(conn, starting: float, trades_df: pd.DataFrame, cs: ChargeSettings) -> None:
