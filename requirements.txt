@@ -1,0 +1,7 @@
+streamlit
+yfinance
+pandas
+numpy
+openpyxl
+lxml
+requests
