@@ -50,6 +50,11 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_trades_position ON trades(position_id);
         """
     )
+    trade_cols = {row[1] for row in conn.execute("PRAGMA table_info(trades)")}
+    if "stop_loss" not in trade_cols:
+        conn.execute("ALTER TABLE trades ADD COLUMN stop_loss REAL")
+    if "target_price" not in trade_cols:
+        conn.execute("ALTER TABLE trades ADD COLUMN target_price REAL")
     defaults = {
         "starting_capital": "500000",
         "charge_settings": json.dumps(
@@ -111,12 +116,15 @@ def set_setting(conn: sqlite3.Connection, key: str, value: str) -> None:
 
 
 def insert_trade(conn: sqlite3.Connection, trade: dict[str, Any]) -> int:
+    stop_loss = trade.get("stop_loss")
+    target_price = trade.get("target_price")
     cur = conn.execute(
         """
         INSERT INTO trades (
             traded_at, symbol, exchange, segment, side, qty, price,
-            position_id, notes, gross, charges, net_cash, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            position_id, notes, gross, charges, net_cash, created_at,
+            stop_loss, target_price
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             trade["traded_at"],
@@ -132,6 +140,8 @@ def insert_trade(conn: sqlite3.Connection, trade: dict[str, Any]) -> int:
             float(trade["charges"]),
             float(trade["net_cash"]),
             trade.get("created_at") or datetime.now(IST).isoformat(),
+            float(stop_loss) if stop_loss is not None else None,
+            float(target_price) if target_price is not None else None,
         ),
     )
     conn.commit()
