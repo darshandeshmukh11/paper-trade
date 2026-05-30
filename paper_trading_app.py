@@ -229,6 +229,21 @@ def _fmt_inr(x: float) -> str:
     return f"₹{x:,.2f}"
 
 
+def _optional_order_price(value: float) -> float | None:
+    """Treat 0 as unset for optional stop loss / target fields."""
+    return float(value) if value and value > 0 else None
+
+
+def _display_optional_price(value: object) -> str:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return "—"
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        return "—"
+    return _fmt_inr(num) if num > 0 else "—"
+
+
 def _color_pnl_cell(val: object) -> str:
     try:
         num = float(val)
@@ -444,6 +459,24 @@ def page_new_trade(conn, starting: float, trades_df: pd.DataFrame, cs: ChargeSet
         with c5:
             position_id = st.text_input("Position ID (optional)", placeholder="T001")
 
+        c6, c7 = st.columns(2)
+        with c6:
+            stop_loss = st.number_input(
+                "Stop loss (₹)",
+                min_value=0.0,
+                value=0.0,
+                step=0.05,
+                help="Optional. Leave 0 if not set.",
+            )
+        with c7:
+            target_price = st.number_input(
+                "Target price (₹)",
+                min_value=0.0,
+                value=0.0,
+                step=0.05,
+                help="Optional. Leave 0 if not set.",
+            )
+
         notes = st.text_input("Notes", placeholder="Swing entry, support rejection, etc.")
         submitted = st.form_submit_button("Submit order", type="primary")
 
@@ -490,6 +523,8 @@ def page_new_trade(conn, starting: float, trades_df: pd.DataFrame, cs: ChargeSet
         "price": float(price),
         "position_id": position_id.strip() or None,
         "notes": notes,
+        "stop_loss": _optional_order_price(float(stop_loss)),
+        "target_price": _optional_order_price(float(target_price)),
         "gross": charges.gross,
         "charges": charges.total,
         "net_cash": net,
@@ -516,6 +551,12 @@ def page_history(conn) -> None:
         return
     df = trades_to_df(trades)
     df["traded_at"] = pd.to_datetime(df["traded_at"]).dt.strftime("%Y-%m-%d %H:%M")
+    if "stop_loss" not in df.columns:
+        df["stop_loss"] = None
+    if "target_price" not in df.columns:
+        df["target_price"] = None
+    df["Stop loss"] = df["stop_loss"].apply(_display_optional_price)
+    df["Target price"] = df["target_price"].apply(_display_optional_price)
     show = df[
         [
             "id",
@@ -524,6 +565,8 @@ def page_history(conn) -> None:
             "side",
             "qty",
             "price",
+            "Stop loss",
+            "Target price",
             "gross",
             "charges",
             "net_cash",
