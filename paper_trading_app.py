@@ -25,8 +25,11 @@ from nse_symbols import (
     to_yahoo_ticker,
 )
 from portfolio import (
+    DEFAULT_LTCG_RATE,
     cash_balance,
     compute_positions,
+    equity_turnover_summary,
+    ltcg_tax_summary,
     performance_metrics,
     realized_pnl,
     trades_to_df,
@@ -463,6 +466,59 @@ def _render_returns_section(
             _show_cycles_table()
 
 
+def _render_turnover_and_tax(
+    trades_df: pd.DataFrame,
+    closed_df: pd.DataFrame,
+    total_pnl: float,
+) -> None:
+    """SEBI-style turnover and post-tax profit (15% LTCG on realized long-term gains)."""
+    turnover = equity_turnover_summary(trades_df, closed_df)
+    tax = ltcg_tax_summary(closed_df, total_pnl, ltcg_rate=DEFAULT_LTCG_RATE)
+
+    st.markdown("#### Turnover & tax (India / SEBI)")
+    st.caption(
+        "**Turnover:** buy/sell = gross traded value per leg. "
+        "**Total (audit):** delivery = sell value only; intraday = |P&L| per closed trade. "
+        f"**Post-tax profit:** total P&L minus {DEFAULT_LTCG_RATE:.0%} LTCG on realized gains held > 12 months."
+    )
+
+    t1, t2, t3, t4 = st.columns(4)
+    t1.metric("Buy turnover", _fmt_inr(turnover["buy_turnover"]))
+    t2.metric("Sell turnover", _fmt_inr(turnover["sell_turnover"]))
+    t3.metric(
+        "Total turnover (audit)",
+        _fmt_inr(turnover["total_turnover"]),
+        help=(
+            f"Delivery sell: {_fmt_inr(turnover['delivery_turnover'])} · "
+            f"Intraday |P&L|: {_fmt_inr(turnover['intraday_turnover'])}"
+        ),
+    )
+    t4.metric(
+        "Delivery / intraday",
+        _fmt_inr(turnover["delivery_turnover"]),
+        f"Intraday |P&L|: {_fmt_inr(turnover['intraday_turnover'])}",
+    )
+
+    p1, p2, p3 = st.columns(3)
+    _pnl_metric(
+        p1,
+        "Total profit (pre-tax)",
+        total_pnl,
+        "Cash + holdings at LTP − starting capital",
+    )
+    p2.metric(
+        "LTCG tax (est. 15%)",
+        _fmt_inr(tax["ltcg_tax"]),
+        help=f"On realized LTCG gains: {_fmt_inr(tax['ltcg_taxable_gains'])}",
+    )
+    _pnl_metric(
+        p3,
+        "Total profit (post-tax LTCG)",
+        tax["post_tax_total_pnl"],
+        f"STCG gains (not taxed here): {_fmt_inr(tax['stcg_taxable_gains'])}",
+    )
+
+
 def _pnl_metric(container, label: str, value: float, subtext: str = "") -> None:
     """Metric with green (profit) or red (loss) value."""
     if value > 0:
@@ -560,6 +616,11 @@ def page_dashboard(conn, starting: float, trades_df: pd.DataFrame) -> None:
     c7.metric("Open positions", str(len(positions)))
 
     perf = _build_performance_context(starting, trades_df, use_live_ltp=True)
+    closed_df = perf.get("closed_df")
+    if closed_df is None:
+        closed_df = pd.DataFrame()
+    _render_turnover_and_tax(trades_df, closed_df, total_pnl)
+
     _render_returns_section(perf, show_cycles_table=True, cycles_expanded=False)
 
     if positions and live_quote_count < len(positions):

@@ -111,6 +111,7 @@ def _fifo_completed_cycles(sym_trades: pd.DataFrame, position_id: str | None) ->
         remaining = qty
         sell_charges = charges
         sell_date = traded_at
+        sell_segment = str(row.get("segment", "Equity Delivery") or "Equity Delivery")
         while remaining > 0 and lots:
             lot = lots[0]
             match = min(remaining, int(lot["qty"]))
@@ -141,6 +142,7 @@ def _fifo_completed_cycles(sym_trades: pd.DataFrame, position_id: str | None) ->
                     "abs_return_pct": round(abs_return_pct, 2),
                     "cagr_pct": round(cagr_pct, 2) if cagr_pct is not None else None,
                     "charges": round(buy_charge_alloc + sell_charge_alloc, 2),
+                    "segment": sell_segment,
                 }
             )
             lot["qty"] -= match
@@ -167,6 +169,7 @@ def completed_round_trips(trades_df: pd.DataFrame) -> pd.DataFrame:
         "abs_return_pct",
         "cagr_pct",
         "charges",
+        "segment",
     ]
     if trades_df.empty:
         return pd.DataFrame(columns=columns)
@@ -229,6 +232,110 @@ def realized_pnl(trades_df: pd.DataFrame) -> float:
 
     total += _fifo_realized_pnl(fifo_df)
     return total
+
+
+INTRADAY_SEGMENT = "Equity Intraday"
+LTCG_HOLDING_DAYS = 365
+DEFAULT_LTCG_RATE = 0.15
+
+
+def _trade_gross_value(trades: pd.DataFrame, side: str) -> float:
+    """Sum gross traded value (qty × price) for one side."""
+    if trades.empty:
+        return 0.0
+    mask = trades["side"].astype(str).str.upper() == side.upper()
+    subset = trades.loc[mask]
+    if subset.empty:
+        return 0.0
+    if "gross" in subset.columns:
+        return float(subset["gross"].fillna(0).sum())
+    return float((subset["qty"] * subset["price"]).sum())
+
+
+def equity_turnover_summary(
+    trades_df: pd.DataFrame,
+    closed_df: Optional[pd.DataFrame] = None,
+) -> dict[str, float]:
+    """Indian equity turnover per SEBI / tax-audit convention.
+
+    - **Buy / sell turnover**: gross traded value on each leg (qty × price).
+    - **Delivery turnover**: sell-side value only (investment / capital-gains trades).
+    - **Intraday turnover**: sum of |realized P&L| per closed intraday round-trip.
+    - **Total turnover**: delivery sell turnover + intraday |P&L|.
+    """
+    empty = {
+        "buy_turnover": 0.0,
+        "sell_turnover": 0.0,
+        "delivery_turnover": 0.0,
+        "intraday_turnover": 0.0,
+        "total_turnover": 0.0,
+    }
+    if trades_df.empty:
+        return empty
+
+    buy_turnover = _trade_gross_value(trades_df, "BUY")
+    sell_turnover = _trade_gross_value(trades_df, "SELL")
+
+    sells = trades_df[trades_df["side"].astype(str).str.upper() == "SELL"]
+    if sells.empty:
+        delivery_turnover = 0.0
+    else:
+        if "segment" in sells.columns:
+            delivery_mask = sells["segment"].fillna("Equity Delivery") != INTRADAY_SEGMENT
+        else:
+            delivery_mask = pd.Series(True, index=sells.index)
+        delivery_sells = sells.loc[delivery_mask]
+        if "gross" in delivery_sells.columns:
+            delivery_turnover = float(delivery_sells["gross"].fillna(0).sum())
+        else:
+            delivery_turnover = float((delivery_sells["qty"] * delivery_sells["price"]).sum())
+
+    closed = closed_df if closed_df is not None else completed_round_trips(trades_df)
+    intraday_turnover = 0.0
+    if not closed.empty and "segment" in closed.columns:
+        intraday_closed = closed[closed["segment"] == INTRADAY_SEGMENT]
+        if not intraday_closed.empty:
+            intraday_turnover = float(intraday_closed["pnl_inr"].abs().sum())
+
+    return {
+        "buy_turnover": round(buy_turnover, 2),
+        "sell_turnover": round(sell_turnover, 2),
+        "delivery_turnover": round(delivery_turnover, 2),
+        "intraday_turnover": round(intraday_turnover, 2),
+        "total_turnover": round(delivery_turnover + intraday_turnover, 2),
+    }
+
+
+def ltcg_tax_summary(
+    closed_df: pd.DataFrame,
+    total_pnl: float,
+    ltcg_rate: float = DEFAULT_LTCG_RATE,
+) -> dict[str, float]:
+    """Estimate LTCG tax at ``ltcg_rate`` on realized gains held > 12 months.
+
+    Post-tax total P&L = mark-to-market total P&L minus estimated LTCG tax
+    (STCG and unrealized gains are not taxed in this estimate).
+    """
+    ltcg_gains = 0.0
+    stcg_gains = 0.0
+    if closed_df is not None and not closed_df.empty:
+        for _, row in closed_df.iterrows():
+            pnl = float(row["pnl_inr"])
+            if pnl <= 0:
+                continue
+            hold = int(row.get("hold_days", 0) or 0)
+            if hold > LTCG_HOLDING_DAYS:
+                ltcg_gains += pnl
+            else:
+                stcg_gains += pnl
+
+    ltcg_tax = round(ltcg_gains * ltcg_rate, 2)
+    return {
+        "ltcg_taxable_gains": round(ltcg_gains, 2),
+        "stcg_taxable_gains": round(stcg_gains, 2),
+        "ltcg_tax": ltcg_tax,
+        "post_tax_total_pnl": round(total_pnl - ltcg_tax, 2),
+    }
 
 
 def _to_datetime(value: Any) -> datetime:
