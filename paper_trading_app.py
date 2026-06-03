@@ -26,8 +26,8 @@ from nse_symbols import (
 )
 from portfolio import (
     cash_balance,
-    completed_round_trips,
     compute_positions,
+    performance_metrics,
     realized_pnl,
     trades_to_df,
 )
@@ -306,6 +306,163 @@ def _style_open_positions_table(df: pd.DataFrame):
     )
 
 
+def _fmt_pct(value: Optional[float], signed: bool = True) -> str:
+    if value is None:
+        return "—"
+    if signed:
+        return f"{value:+.2f}%"
+    return f"{value:.2f}%"
+
+
+def _metric_pct(container, label: str, value: Optional[float], subtext: str = "") -> None:
+    """Metric tile for percentage returns (XIRR, CAGR, etc.)."""
+    if value is None:
+        color = PNL_COLOR_NEUTRAL
+        text = "—"
+    elif value > 0:
+        color = PNL_COLOR_PROFIT
+        text = f"{value:+.2f}%"
+    elif value < 0:
+        color = PNL_COLOR_LOSS
+        text = f"{value:+.2f}%"
+    else:
+        color = PNL_COLOR_NEUTRAL
+        text = "0.00%"
+    sub = (
+        f'<p style="margin:0.15rem 0 0;font-size:0.8rem;color:{color};">{subtext}</p>'
+        if subtext
+        else ""
+    )
+    with container:
+        st.markdown(
+            f'<p style="margin:0;font-size:0.875rem;color:{PNL_COLOR_LABEL};">{label}</p>'
+            f'<p style="margin:0;font-size:1.75rem;font-weight:600;color:{color};">{text}</p>'
+            f"{sub}",
+            unsafe_allow_html=True,
+        )
+
+
+def _portfolio_equity(
+    starting: float, trades_df: pd.DataFrame, use_live_ltp: bool = True
+) -> tuple[float, float, float]:
+    """Return (cash, holdings_value, equity). Holdings use LTP when use_live_ltp."""
+    cash = cash_balance(starting, trades_df)
+    positions = compute_positions(trades_df)
+    holdings_value = 0.0
+    if use_live_ltp and positions:
+        quotes = _fetch_quotes_parallel(positions)
+        for p in positions:
+            q = quotes.get(p.symbol)
+            ltp = q.price if q is not None else p.avg_cost
+            holdings_value += ltp * p.qty
+    else:
+        holdings_value = sum(p.cost_basis for p in positions)
+    return cash, holdings_value, cash + holdings_value
+
+
+def _build_performance_context(
+    starting: float, trades_df: pd.DataFrame, use_live_ltp: bool = True
+) -> dict:
+    _, _, equity = _portfolio_equity(starting, trades_df, use_live_ltp=use_live_ltp)
+    return performance_metrics(trades_df, starting, equity)
+
+
+def _render_returns_section(
+    perf: dict,
+    *,
+    show_cycles_table: bool = True,
+    cycles_expanded: bool = False,
+    use_styled_cycles: bool = False,
+) -> None:
+    """Portfolio + closed-trade return metrics (shared by Dashboard and History)."""
+    st.subheader("Returns (holding period & cash flows)")
+    st.caption(
+        "**Absolute return** = total gain on starting capital (current equity vs starting). "
+        "**XIRR** = annualized return from dated cash flows (capital, trades, current equity). "
+        "**CAGR** = annualized portfolio growth over calendar days since first trade. "
+        "Per-trade **days held**, **abs. return %**, and **CAGR %** use FIFO buy → sell dates."
+    )
+    r1, r2, r3, r4 = st.columns(4)
+    _metric_pct(
+        r1,
+        "Absolute return",
+        perf.get("abs_return_pct"),
+        f"{perf.get('portfolio_days', 0)} days since first trade",
+    )
+    _metric_pct(r2, "XIRR (annualized)", perf.get("xirr_pct"), "Money-weighted")
+    _metric_pct(r3, "CAGR (annualized)", perf.get("cagr_pct"), "Portfolio level")
+    with r4:
+        avg_hold = perf.get("avg_hold_days")
+        hold_txt = f"{avg_hold:.0f} days" if avg_hold is not None else "—"
+        st.metric("Avg hold (closed)", hold_txt, f"{perf.get('closed_trades', 0)} round-trips")
+
+    r5, r6, r7 = st.columns(3)
+    _metric_pct(
+        r5,
+        "Avg abs. return (closed)",
+        perf.get("avg_closed_abs_return_pct"),
+        "Per completed trade",
+    )
+    _metric_pct(
+        r6,
+        "Avg CAGR (closed)",
+        perf.get("avg_closed_cagr_pct"),
+        "Annualized per trade",
+    )
+    r7.metric("Portfolio days", str(perf.get("portfolio_days", 0)))
+
+    if not show_cycles_table:
+        return
+
+    closed_df = perf.get("closed_df")
+    if closed_df is None or closed_df.empty:
+        st.info("No completed buy/sell cycles yet — returns above are portfolio-level only.")
+        return
+
+    def _show_cycles_table() -> None:
+        if use_styled_cycles:
+            st.dataframe(
+                _style_completed_cycles_table(closed_df),
+                use_container_width=True,
+                hide_index=True,
+            )
+        else:
+            show = closed_df[
+                [
+                    "symbol",
+                    "buy_date",
+                    "sell_date",
+                    "hold_days",
+                    "qty",
+                    "buy_avg",
+                    "sell_avg",
+                    "pnl_inr",
+                    "abs_return_pct",
+                    "cagr_pct",
+                ]
+            ].copy()
+            show.columns = [
+                "Symbol",
+                "Buy date",
+                "Sell date",
+                "Days held",
+                "Qty",
+                "Buy avg (₹)",
+                "Sell avg (₹)",
+                "P&L (₹)",
+                "Abs. return %",
+                "CAGR %",
+            ]
+            st.dataframe(show, use_container_width=True, hide_index=True)
+
+    if cycles_expanded:
+        st.markdown("#### Completed trades — return & holding period")
+        _show_cycles_table()
+    else:
+        with st.expander("Completed trades — return & holding period", expanded=False):
+            _show_cycles_table()
+
+
 def _pnl_metric(container, label: str, value: float, subtext: str = "") -> None:
     """Metric with green (profit) or red (loss) value."""
     if value > 0:
@@ -401,6 +558,9 @@ def page_dashboard(conn, starting: float, trades_df: pd.DataFrame) -> None:
     _pnl_metric(c5, "Unrealized P&L (open)", mtm)
     _pnl_metric(c6, "Realized P&L (closed)", realized)
     c7.metric("Open positions", str(len(positions)))
+
+    perf = _build_performance_context(starting, trades_df, use_live_ltp=True)
+    _render_returns_section(perf, show_cycles_table=True, cycles_expanded=False)
 
     if positions and live_quote_count < len(positions):
         st.warning(
@@ -598,36 +758,70 @@ def _style_completed_cycles_table(df: pd.DataFrame):
     display = df.copy()
     display["buy_date"] = pd.to_datetime(display["buy_date"]).dt.strftime("%Y-%m-%d %H:%M")
     display["sell_date"] = pd.to_datetime(display["sell_date"]).dt.strftime("%Y-%m-%d %H:%M")
+    if "abs_return_pct" not in display.columns and "return_pct" in display.columns:
+        display["abs_return_pct"] = display["return_pct"]
+    if "hold_days" not in display.columns:
+        display["hold_days"] = 0
+    if "cagr_pct" not in display.columns:
+        display["cagr_pct"] = None
+    display = display[
+        [
+            "symbol",
+            "position_id",
+            "buy_date",
+            "sell_date",
+            "hold_days",
+            "qty",
+            "buy_avg",
+            "sell_avg",
+            "pnl_inr",
+            "abs_return_pct",
+            "cagr_pct",
+            "return_pct",
+            "charges",
+        ]
+    ]
     display = display.rename(
         columns={
             "symbol": "Symbol",
             "position_id": "Position ID",
+            "buy_date": "Buy date",
+            "sell_date": "Sell date",
+            "hold_days": "Days held",
             "qty": "Qty",
             "buy_avg": "Buy avg",
             "sell_avg": "Sell avg",
-            "buy_date": "Buy date",
-            "sell_date": "Sell date",
             "pnl_inr": "P&L ₹",
+            "abs_return_pct": "Abs. return %",
+            "cagr_pct": "CAGR %",
             "return_pct": "Return %",
             "charges": "Charges",
         }
     )
     styler = display.style.set_table_styles(dark_table)
+    pct_cols = ["Abs. return %", "Return %", "CAGR %"]
+    for col in pct_cols:
+        if col in display.columns:
+            if hasattr(styler, "map"):
+                styler = styler.map(_color_return_pct_cell, subset=[col])
+            else:
+                styler = styler.applymap(_color_return_pct_cell, subset=[col])
     if hasattr(styler, "map"):
-        styler = styler.map(_color_return_pct_cell, subset=["Return %"])
         styler = styler.map(_color_pnl_cell, subset=["P&L ₹"])
     else:
-        styler = styler.applymap(_color_return_pct_cell, subset=["Return %"])
         styler = styler.applymap(_color_pnl_cell, subset=["P&L ₹"])
-    return styler.format(
-        {
-            "Buy avg": "₹{:,.2f}",
-            "Sell avg": "₹{:,.2f}",
-            "P&L ₹": "₹{:+,.2f}",
-            "Return %": "{:+.2f}%",
-            "Charges": "₹{:,.2f}",
-        }
-    )
+    fmt = {
+        "Buy avg": "₹{:,.2f}",
+        "Sell avg": "₹{:,.2f}",
+        "P&L ₹": "₹{:+,.2f}",
+        "Abs. return %": "{:+.2f}%",
+        "Return %": "{:+.2f}%",
+        "Charges": "₹{:,.2f}",
+        "Days held": "{:.0f}",
+    }
+    if "CAGR %" in display.columns:
+        fmt["CAGR %"] = "{:+.2f}%"
+    return styler.format(fmt, na_rep="—")
 
 
 def page_risk_reward() -> None:
@@ -692,29 +886,20 @@ def page_risk_reward() -> None:
 
 def page_history(conn) -> None:
     st.subheader("Trade history")
+    starting = float(get_setting(conn, "starting_capital", "500000"))
     trades = list_trades(conn, limit=300)
     if not trades:
         st.write("No trades yet.")
         return
 
     trades_df = trades_to_df(trades)
-    cycles = completed_round_trips(trades_df)
-    st.markdown("#### Completed buy / sell cycles")
-    st.caption(
-        "Each row is a closed round-trip (sell matched to earlier buys, FIFO). "
-        "**Return %** is net P&L after allocated charges vs buy cost."
+    perf = _build_performance_context(starting, trades_df, use_live_ltp=True)
+    _render_returns_section(
+        perf,
+        show_cycles_table=True,
+        cycles_expanded=True,
+        use_styled_cycles=True,
     )
-    if cycles.empty:
-        st.info("No completed cycles yet — record a **SELL** that closes a prior **BUY**.")
-    else:
-        wins = int((cycles["return_pct"] > 0).sum())
-        losses = int((cycles["return_pct"] < 0).sum())
-        st.caption(f"**{len(cycles)}** closed cycle(s) · **{wins}** gain · **{losses}** loss")
-        st.dataframe(
-            _style_completed_cycles_table(cycles),
-            use_container_width=True,
-            hide_index=True,
-        )
 
     st.markdown("#### All trades")
     df = trades_to_df(trades)
