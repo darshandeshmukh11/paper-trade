@@ -2,38 +2,44 @@
 
 Web app and Excel workbook for virtual NSE/BSE paper trading with approximate Indian brokerage charges.
 
-**Symbols:** Full NSE list (~2,100+ symbols) plus **Nifty 50** and **Nifty 100** filters on the New trade tab. Search by partial name (e.g. `TATAST` → TATASTEEL).
+**Symbols:** Full NSE list (~2,100+ symbols) plus **Nifty 50** and **Nifty 100** filters on the New trade tab.
 
 ## Run the web app
 
 ```bash
-cd /Users/admin/Desktop/Codebase/ri/test/paper-trade
+cd test/paper-trade
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 streamlit run paper_trading_app.py
 ```
 
-Open http://localhost:8501 — trades persist in `data/paper_trades.db`.
+Open http://localhost:8501
 
-Optional password: copy `.streamlit/secrets.toml.example` → `.streamlit/secrets.toml` and set `PAPER_PASSWORD`.
+| Storage | When |
+|---------|------|
+| **Supabase** | `SUPABASE_DB_URL` in Streamlit secrets or env — see [DEPLOY_SUPABASE.md](DEPLOY_SUPABASE.md) |
+| **paper_trades.db** | Local SQLite in this folder (no Supabase URL) |
 
-## Excel workbook
+## Excel workbook (no hosting)
 
 ```bash
 python build_paper_trading_sheet.py
-# → paper_trading_india.xlsx
+python build_paper_trading_sheet.py --import ~/Downloads/paper_trading_backup.json
+python build_paper_trading_sheet.py --refresh
 ```
 
-## Deploy online
+Output: `paper_trading_india.xlsx` in this folder.
 
-See [DEPLOY_PAPER_TRADING.md](DEPLOY_PAPER_TRADING.md). Streamlit Cloud **main file path**: `test/paper-trade/paper_trading_app.py`.
+## Files (flat layout)
 
-## Layout
-
-| Path | Purpose |
+| File | Purpose |
 |------|---------|
 | `paper_trading_app.py` | Streamlit UI |
-| `paper_trading/` | Charges, SQLite store, portfolio math |
-| `build_paper_trading_sheet.py` | Generate Excel template |
-| `data/paper_trades.db` | Local trade database |
+| `store.py`, `db.py` | SQLite or Supabase persistence |
+| `charges.py`, `portfolio.py` | Brokerage math, P&L |
+| `nse_symbols.py`, `nifty_indices.py`, `live_price.py` | Symbols and LTP |
+| `build_paper_trading_sheet.py`, `excel_workbook.py` | Excel export |
+| `schema.sql` | Run once in Supabase SQL editor |
+| `nse_equity_symbols.json` | Cached NSE symbol list |
+| `secrets.toml.example` | Local / reference secrets |

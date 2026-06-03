@@ -4,4 +4,4 @@ pandas
 numpy
 openpyxl
 lxml
-requests
+psycopg[binary]>=3.1

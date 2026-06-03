@@ -12,27 +12,28 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 import streamlit as st
 
-from paper_trading.charges import ChargeSettings, compute_charges, net_cash_flow
-from paper_trading.nifty_indices import (
+from charges import ChargeSettings, compute_charges, net_cash_flow
+from nifty_indices import (
     get_nifty100_symbols,
     get_nifty50_symbols,
     intersect_with_nse_universe,
 )
-from paper_trading.nse_symbols import (
+from nse_symbols import (
     get_nse_equity_symbols,
     normalize_nse_symbol,
     symbol_picker_options,
     to_yahoo_ticker,
 )
-from paper_trading.portfolio import (
+from portfolio import (
     cash_balance,
     completed_round_trips,
     compute_positions,
     realized_pnl,
     trades_to_df,
 )
-from paper_trading.store import (
+from store import (
     connect,
+    delete_all_trades,
     delete_trade,
     export_all,
     get_setting,
@@ -41,6 +42,7 @@ from paper_trading.store import (
     insert_trade,
     list_trades,
     set_setting,
+    storage_label,
 )
 
 IST = ZoneInfo("Asia/Kolkata")
@@ -214,14 +216,14 @@ def _universe_for_index(index_filter: str, nse_universe: list[str]) -> list[str]
 
 @st.cache_data(ttl=30)
 def fetch_ltp(symbol: str, exchange: str = "NSE") -> Optional[float]:
-    from paper_trading.live_price import fetch_live_price
+    from live_price import fetch_live_price
 
     return fetch_live_price(symbol, exchange)
 
 
 @st.cache_data(ttl=30)
 def fetch_ltp_quote(symbol: str, exchange: str = "NSE"):
-    from paper_trading.live_price import fetch_live_quote
+    from live_price import fetch_live_quote
 
     return fetch_live_quote(symbol, exchange)
 
@@ -775,7 +777,7 @@ def page_settings(conn) -> None:
 
     st.markdown("#### Danger zone")
     if st.button("Reset all trades", type="secondary"):
-        conn.execute("DELETE FROM trades")
+        delete_all_trades(conn)
         st.warning("All trades deleted.")
         st.rerun()
 
@@ -791,9 +793,9 @@ def main() -> None:
     if not _check_password():
         return
 
-    db_path = init_db()
+    init_db()
     st.sidebar.title("Paper trading")
-    st.sidebar.caption(f"INR · NSE/BSE · DB: `{db_path.name}`")
+    st.sidebar.caption(f"INR · NSE/BSE · Storage: **{storage_label()}**")
     if st.sidebar.button("Refresh LTP / prices"):
         fetch_ltp.clear()
         fetch_ltp_quote.clear()
