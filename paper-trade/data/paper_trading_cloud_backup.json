@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "exported_at": "2026-06-03T15:01:41.042751+05:30",
+  "exported_at": "2026-06-03T15:02:22.583161+05:30",
   "settings": {
     "starting_capital": "1000000.0",
     "charge_settings": "{\"brokerage_per_order\": 20, \"gst_on_brokerage\": 0.18, \"stt_delivery_sell\": 0.001, \"stt_intraday_sell\": 0.00025, \"exchange_txn_pct\": 3.45e-05, \"sebi_pct\": 1e-06, \"stamp_duty_buy\": 0.00015, \"dp_delivery_sell\": 15.93}"
@@ -48,15 +48,15 @@
       "symbol": "TATASTEEL",
       "exchange": "NSE",
       "segment": "Equity Delivery",
-      "side": "SELL",
-      "qty": 10,
-      "price": 211.6699981689453,
+      "side": "BUY",
+      "qty": 1000,
+      "price": 211.72999572753906,
       "position_id": null,
       "notes": "",
-      "gross": 2116.699981689453,
-      "charges": 41.72184283103943,
-      "net_cash": 2074.978138858414,
-      "created_at": "2026-06-03T15:01:41.017702+05:30",
+      "gross": 211729.99572753906,
+      "charges": 62.87591420745849,
+      "net_cash": -211792.87164174652,
+      "created_at": "2026-06-03T15:02:22.558219+05:30",
       "stop_loss": null,
       "target_price": null
     }
