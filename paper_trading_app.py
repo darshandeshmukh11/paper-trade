@@ -31,6 +31,12 @@ from paper_trading.portfolio import (
     realized_pnl,
     trades_to_df,
 )
+from paper_trading.github_backup import (
+    best_available_backup,
+    config_status_line,
+    load_config,
+    push_cloud_backup,
+)
 from paper_trading.store import (
     connect,
     delete_trade,
@@ -228,6 +234,39 @@ def fetch_ltp_quote(symbol: str, exchange: str = "NSE"):
 
 def _fmt_inr(x: float) -> str:
     return f"₹{x:,.2f}"
+
+
+def _maybe_restore_cloud_backup(conn) -> None:
+    """Load trades from repo JSON (git clone + GitHub API) once per session."""
+    if st.session_state.get("cloud_backup_restored"):
+        return
+    st.session_state["cloud_backup_restored"] = True
+
+    cfg = load_config()
+    data, msg = best_available_backup(cfg)
+    if not data:
+        st.session_state["cloud_backup_status"] = msg
+        return
+
+    remote_count = len(data.get("trades", []))
+    if remote_count == 0 and not data.get("settings"):
+        st.session_state["cloud_backup_status"] = "Backup file has no trades or settings."
+        return
+
+    local_count = len(list_trades(conn))
+    if local_count == 0 or remote_count > local_count:
+        import_backup(conn, data, replace=True)
+        st.session_state["cloud_backup_status"] = f"Restored {remote_count} trade(s). {msg}"
+    else:
+        st.session_state["cloud_backup_status"] = (
+            f"Using local DB ({local_count} trades; backup has {remote_count}). {msg}"
+        )
+
+
+def _persist_cloud_backup(conn) -> str:
+    msg = push_cloud_backup(export_all(conn))
+    st.session_state["cloud_backup_status"] = msg
+    return msg
 
 
 def _optional_order_price(value: float) -> float | None:
@@ -548,6 +587,11 @@ def page_new_trade(conn, starting: float, trades_df: pd.DataFrame, cs: ChargeSet
         st.error(f"Could not save order: {exc}")
         return
 
+    try:
+        _persist_cloud_backup(conn)
+    except Exception as exc:
+        st.warning(f"Trade saved (#{tid}) but GitHub backup failed: {exc}")
+
     st.session_state["toast"] = (
         "success",
         f"Order #{tid} saved — {side} {int(qty)} {sym} @ {_fmt_inr(float(price))}. See **History**.",
@@ -729,6 +773,10 @@ def page_history(conn) -> None:
     del_id = st.number_input("Trade ID to delete", min_value=1, step=1)
     if st.button("Delete trade", type="secondary"):
         delete_trade(conn, int(del_id))
+        try:
+            _persist_cloud_backup(conn)
+        except Exception as exc:
+            st.warning(f"Deleted locally; GitHub backup failed: {exc}")
         st.warning(f"Deleted trade #{int(del_id)}")
         st.rerun()
 
@@ -739,6 +787,10 @@ def page_settings(conn) -> None:
     new_cap = st.number_input("Starting capital (₹)", value=starting, step=10000.0)
     if st.button("Save starting capital"):
         set_setting(conn, "starting_capital", str(new_cap))
+        try:
+            _persist_cloud_backup(conn)
+        except Exception as exc:
+            st.warning(f"Saved locally; GitHub backup failed: {exc}")
         st.success("Saved.")
         st.rerun()
 
@@ -748,11 +800,45 @@ def page_settings(conn) -> None:
     cs.gst_on_brokerage = st.number_input("GST on brokerage (0.18 = 18%)", value=cs.gst_on_brokerage, format="%.4f")
     if st.button("Save charge settings"):
         _save_charge_settings(conn, cs)
+        try:
+            _persist_cloud_backup(conn)
+        except Exception as exc:
+            st.warning(f"Saved locally; GitHub backup failed: {exc}")
         st.success("Charge settings saved.")
 
-    st.markdown("#### Backup & restore")
+    st.markdown("#### GitHub backup (same repo)")
+    st.markdown(config_status_line())
+    status = st.session_state.get("cloud_backup_status", "")
+    if status:
+        st.caption(status)
+    g1, g2 = st.columns(2)
+    with g1:
+        if st.button("Push backup to GitHub now", type="primary"):
+            try:
+                msg = _persist_cloud_backup(conn)
+                st.success(msg)
+            except Exception as exc:
+                st.error(str(exc))
+            st.rerun()
+    with g2:
+        if st.button("Pull backup from GitHub / repo"):
+            cfg = load_config()
+            data, msg = best_available_backup(cfg)
+            if not data:
+                st.error(msg)
+            else:
+                n = import_backup(conn, data, replace=True)
+                st.success(f"Restored {n} trades. {msg}")
+                try:
+                    _persist_cloud_backup(conn)
+                except Exception as exc:
+                    st.warning(f"Restored locally; re-push failed: {exc}")
+            st.rerun()
+
+    st.markdown("#### Manual backup (JSON file)")
     st.caption(
-        "On Streamlit Cloud the database resets when the app sleeps. Export regularly and import after redeploy."
+        "Cloud SQLite is ephemeral; **GitHub backup** (above) is the primary store when secrets are set. "
+        "Use download/import as a fallback."
     )
     backup = export_all(conn)
     st.download_button(
@@ -765,17 +851,29 @@ def page_settings(conn) -> None:
     if uploaded and st.button("Import (merge)"):
         data = json.load(uploaded)
         n = import_backup(conn, data, replace=False)
+        try:
+            _persist_cloud_backup(conn)
+        except Exception as exc:
+            st.warning(f"Imported; GitHub backup failed: {exc}")
         st.success(f"Imported {n} trades.")
         st.rerun()
     if uploaded and st.button("Import (replace all data)", type="secondary"):
         data = json.load(uploaded)
         n = import_backup(conn, data, replace=True)
+        try:
+            _persist_cloud_backup(conn)
+        except Exception as exc:
+            st.warning(f"Imported; GitHub backup failed: {exc}")
         st.success(f"Replaced with {n} trades.")
         st.rerun()
 
     st.markdown("#### Danger zone")
     if st.button("Reset all trades", type="secondary"):
         conn.execute("DELETE FROM trades")
+        try:
+            _persist_cloud_backup(conn)
+        except Exception as exc:
+            st.warning(f"Reset locally; GitHub backup failed: {exc}")
         st.warning("All trades deleted.")
         st.rerun()
 
@@ -794,12 +892,15 @@ def main() -> None:
     db_path = init_db()
     st.sidebar.title("Paper trading")
     st.sidebar.caption(f"INR · NSE/BSE · DB: `{db_path.name}`")
+    if st.session_state.get("cloud_backup_status"):
+        st.sidebar.caption(st.session_state["cloud_backup_status"])
     if st.sidebar.button("Refresh LTP / prices"):
         fetch_ltp.clear()
         fetch_ltp_quote.clear()
         st.rerun()
 
     with connect() as conn:
+        _maybe_restore_cloud_backup(conn)
         starting = float(get_setting(conn, "starting_capital", "500000"))
         cs = _load_charge_settings(conn)
         trades = list_trades(conn)
