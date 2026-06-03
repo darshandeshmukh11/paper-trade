@@ -26,6 +26,7 @@ from paper_trading.nse_symbols import (
 )
 from paper_trading.portfolio import (
     cash_balance,
+    completed_round_trips,
     compute_positions,
     realized_pnl,
     trades_to_df,
@@ -242,6 +243,18 @@ def _display_optional_price(value: object) -> str:
     except (TypeError, ValueError):
         return "—"
     return _fmt_inr(num) if num > 0 else "—"
+
+
+def _color_return_pct_cell(val: object) -> str:
+    try:
+        num = float(val)
+    except (TypeError, ValueError):
+        return f"color: {PNL_COLOR_NEUTRAL}"
+    if num > 0:
+        return f"color: {PNL_COLOR_PROFIT}; font-weight: 600"
+    if num < 0:
+        return f"color: {PNL_COLOR_LOSS}; font-weight: 600"
+    return f"color: {PNL_COLOR_NEUTRAL}"
 
 
 def _color_pnl_cell(val: object) -> str:
@@ -543,12 +556,147 @@ def page_new_trade(conn, starting: float, trades_df: pd.DataFrame, cs: ChargeSet
     st.rerun()
 
 
+def _style_completed_cycles_table(df: pd.DataFrame):
+    dark_table = [
+        {
+            "selector": "th",
+            "props": [
+                ("background-color", "#1a1a1a"),
+                ("color", "#e4e4e7"),
+                ("border-color", "#262626"),
+            ],
+        },
+        {
+            "selector": "td",
+            "props": [
+                ("background-color", "#0f0f0f"),
+                ("color", "#d4d4d8"),
+                ("border-color", "#262626"),
+            ],
+        },
+    ]
+    display = df.copy()
+    display["buy_date"] = pd.to_datetime(display["buy_date"]).dt.strftime("%Y-%m-%d %H:%M")
+    display["sell_date"] = pd.to_datetime(display["sell_date"]).dt.strftime("%Y-%m-%d %H:%M")
+    display = display.rename(
+        columns={
+            "symbol": "Symbol",
+            "position_id": "Position ID",
+            "qty": "Qty",
+            "buy_avg": "Buy avg",
+            "sell_avg": "Sell avg",
+            "buy_date": "Buy date",
+            "sell_date": "Sell date",
+            "pnl_inr": "P&L ₹",
+            "return_pct": "Return %",
+            "charges": "Charges",
+        }
+    )
+    styler = display.style.set_table_styles(dark_table)
+    if hasattr(styler, "map"):
+        styler = styler.map(_color_return_pct_cell, subset=["Return %"])
+        styler = styler.map(_color_pnl_cell, subset=["P&L ₹"])
+    else:
+        styler = styler.applymap(_color_return_pct_cell, subset=["Return %"])
+        styler = styler.applymap(_color_pnl_cell, subset=["P&L ₹"])
+    return styler.format(
+        {
+            "Buy avg": "₹{:,.2f}",
+            "Sell avg": "₹{:,.2f}",
+            "P&L ₹": "₹{:+,.2f}",
+            "Return %": "{:+.2f}%",
+            "Charges": "₹{:,.2f}",
+        }
+    )
+
+
+def page_risk_reward() -> None:
+    st.subheader("Risk / reward calculator")
+    st.caption(
+        "Plan a **long** trade before you place an order. "
+        "Entry must be above stop loss and below target."
+    )
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        entry = st.number_input("Entry price (₹)", min_value=0.01, value=1000.0, step=0.05)
+    with c2:
+        stop_loss = st.number_input("Stop loss (₹)", min_value=0.01, value=980.0, step=0.05)
+    with c3:
+        target = st.number_input("Target price (₹)", min_value=0.01, value=1050.0, step=0.05)
+
+    qty = st.number_input(
+        "Quantity (optional — for ₹ risk & reward)",
+        min_value=0,
+        value=0,
+        step=1,
+        help="Leave 0 to see per-share risk/reward only.",
+    )
+
+    if entry <= stop_loss:
+        st.error("For a long trade, **entry** must be **above** stop loss.")
+        return
+    if target <= entry:
+        st.error("For a long trade, **target** must be **above** entry.")
+        return
+
+    risk_per_share = entry - stop_loss
+    reward_per_share = target - entry
+    risk_reward_ratio = reward_per_share / risk_per_share if risk_per_share else 0.0
+    risk_pct = (risk_per_share / entry) * 100
+    reward_pct = (reward_per_share / entry) * 100
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Risk / share", _fmt_inr(risk_per_share), f"−{risk_pct:.2f}%")
+    m2.metric("Reward / share", _fmt_inr(reward_per_share), f"+{reward_pct:.2f}%")
+    m3.metric("Risk : reward", f"1 : {risk_reward_ratio:.2f}")
+    m4.metric("Reward : risk", f"{risk_reward_ratio:.2f} : 1")
+
+    if qty > 0:
+        st.markdown("#### Position size")
+        t1, t2, t3 = st.columns(3)
+        total_risk = risk_per_share * qty
+        total_reward = reward_per_share * qty
+        _pnl_metric(t1, "Max loss (to stop)", -total_risk)
+        _pnl_metric(t2, "Target profit", total_reward)
+        t3.metric("Capital at entry", _fmt_inr(entry * qty))
+
+    st.info(
+        f"If price hits **stop** ({_fmt_inr(stop_loss)}), you lose "
+        f"**{risk_pct:.2f}%** per share"
+        + (f" (~{_fmt_inr(risk_per_share * qty)} on {qty} shares)." if qty > 0 else ".")
+        + f" If price hits **target** ({_fmt_inr(target)}), you gain **+{reward_pct:.2f}%**"
+        + (f" (~{_fmt_inr(reward_per_share * qty)})." if qty > 0 else ".")
+    )
+
+
 def page_history(conn) -> None:
     st.subheader("Trade history")
     trades = list_trades(conn, limit=300)
     if not trades:
         st.write("No trades yet.")
         return
+
+    trades_df = trades_to_df(trades)
+    cycles = completed_round_trips(trades_df)
+    st.markdown("#### Completed buy / sell cycles")
+    st.caption(
+        "Each row is a closed round-trip (sell matched to earlier buys, FIFO). "
+        "**Return %** is net P&L after allocated charges vs buy cost."
+    )
+    if cycles.empty:
+        st.info("No completed cycles yet — record a **SELL** that closes a prior **BUY**.")
+    else:
+        wins = int((cycles["return_pct"] > 0).sum())
+        losses = int((cycles["return_pct"] < 0).sum())
+        st.caption(f"**{len(cycles)}** closed cycle(s) · **{wins}** gain · **{losses}** loss")
+        st.dataframe(
+            _style_completed_cycles_table(cycles),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    st.markdown("#### All trades")
     df = trades_to_df(trades)
     df["traded_at"] = pd.to_datetime(df["traded_at"]).dt.strftime("%Y-%m-%d %H:%M")
     if "stop_loss" not in df.columns:
@@ -657,7 +805,7 @@ def main() -> None:
         trades = list_trades(conn)
         trades_df = trades_to_df(trades)
 
-        nav_options = ["Dashboard", "New trade", "History", "Settings"]
+        nav_options = ["Dashboard", "New trade", "Risk / reward", "History", "Settings"]
         if "nav_tab" in st.session_state:
             st.session_state["nav_tab_radio"] = st.session_state.pop("nav_tab")
         tab = st.sidebar.radio(
@@ -688,6 +836,8 @@ def main() -> None:
             page_dashboard(conn, starting, trades_df)
         elif tab == "New trade":
             page_new_trade(conn, starting, trades_df, cs)
+        elif tab == "Risk / reward":
+            page_risk_reward()
         elif tab == "History":
             page_history(conn)
         else:
