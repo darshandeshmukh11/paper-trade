@@ -16,7 +16,6 @@ DEFAULT_DB = APP_DIR / "paper_trades.db"
 
 
 def _load_local_secrets() -> None:
-    """Load secrets.toml from app folder (flat layout, no .streamlit/)."""
     path = APP_DIR / "secrets.toml"
     if not path.is_file():
         return
@@ -77,133 +76,182 @@ def _project_ref_from_host(host: str) -> Optional[str]:
     return m.group(1) if m else None
 
 
-def _pooler_url(project_ref: str, password: str, region: str) -> str:
-    from urllib.parse import quote
+def _postgres_password() -> str:
+    from urllib.parse import unquote, urlparse
 
-    user = f"postgres.{project_ref}"
-    host = f"aws-0-{region}.pooler.supabase.com"
-    pass_q = quote(password, safe="")
-    user_q = quote(user, safe="")
-    return (
-        f"postgresql://{user_q}:{pass_q}@{host}:6543/postgres?sslmode=require"
-    )
-
-
-def _build_url_from_parts() -> Optional[str]:
-    """Split secrets — best for Streamlit Cloud and special characters in password."""
-    password = _read_secret("SUPABASE_PASSWORD")
-    if _invalid_password(password):
-        return None
-
-    host = _read_secret("SUPABASE_HOST")
-    region = _read_secret("SUPABASE_REGION")
-    project_ref = _read_secret("SUPABASE_PROJECT_REF")
-
-    if not host and project_ref and region:
-        return _pooler_url(project_ref, password, region)
-
-    if not host:
-        return None
-
-    from urllib.parse import quote
-
-    user = _read_secret("SUPABASE_USER")
-    if not user and project_ref:
-        user = f"postgres.{project_ref}"
-    user = user or "postgres"
-    port = _read_secret("SUPABASE_PORT") or "6543"
-    dbname = _read_secret("SUPABASE_DB") or "postgres"
-    user_q = quote(user, safe="")
-    pass_q = quote(password, safe="")
-    return (
-        f"postgresql://{user_q}:{pass_q}@{host}:{port}/{dbname}?sslmode=require"
-    )
-
-
-def normalize_database_url(raw: str) -> str:
-    """Validate and fix common Supabase URI mistakes from Streamlit secrets."""
-    url = _clean_secret(raw)
-    if not url:
-        raise ValueError("SUPABASE_DB_URL is empty.")
-
-    if "[YOUR-PASSWORD]" in url or "YOUR-PASSWORD" in url.upper():
-        raise ValueError(
-            "SUPABASE_DB_URL still contains [YOUR-PASSWORD]. "
-            "Replace it with your real database password from "
-            "Supabase → Project Settings → Database → Database password."
-        )
-
-    if not url.startswith(("postgresql://", "postgres://")):
-        raise ValueError(
-            "SUPABASE_DB_URL must start with postgresql:// "
-            "(use Transaction pooler URI, port 6543 — not the template from the docs)."
-        )
-
-    from urllib.parse import quote, unquote, urlparse, urlunparse
-
-    parsed = urlparse(url)
-    if not parsed.hostname:
-        raise ValueError(
-            "SUPABASE_DB_URL looks invalid (no host). "
-            "Use split secrets: SUPABASE_PROJECT_REF, SUPABASE_REGION, SUPABASE_PASSWORD."
-        )
-
-    raw_password = unquote(parsed.password or "")
-    if _invalid_password(raw_password):
-        raise ValueError(
-            "Database password is missing or still a placeholder. "
-            "Set your real password in SUPABASE_DB_URL or SUPABASE_PASSWORD."
-        )
-
-    # Direct URL (db.xxx.supabase.co:5432) often fails on Streamlit Cloud → use pooler.
-    project_ref = _project_ref_from_host(parsed.hostname)
-    port = parsed.port or 5432
-    if project_ref and port == 5432 and "pooler.supabase.com" not in (parsed.hostname or ""):
-        region = _read_secret("SUPABASE_REGION") or "ap-southeast-1"
-        return _pooler_url(project_ref, raw_password, region)
-
-    if parsed.username:
-        user = quote(unquote(parsed.username), safe="")
-        password = quote(raw_password, safe="")
-        host = parsed.hostname
-        netloc = f"{user}:{password}@{host}"
-        if parsed.port:
-            netloc += f":{parsed.port}"
-        query = parsed.query or ""
-        if "sslmode" not in query:
-            query = f"{query}&sslmode=require".lstrip("&") if query else "sslmode=require"
-        url = urlunparse(
-            (parsed.scheme, netloc, parsed.path or "/postgres", parsed.params, query, "")
-        )
-    elif "sslmode=" not in url:
-        sep = "&" if "?" in url else "?"
-        url = f"{url}{sep}sslmode=require"
-
-    return url
-
-
-def database_url() -> Optional[str]:
-    """Postgres URI from Streamlit secrets or env (Supabase → Settings → Database)."""
+    pw = _read_secret("SUPABASE_PASSWORD")
+    if pw and not _invalid_password(pw):
+        return pw
     for key in ("SUPABASE_DB_URL", "DATABASE_URL", "POSTGRES_URL"):
+        url = _clean_secret(_read_secret(key))
+        if not url or "[YOUR-PASSWORD]" in url:
+            continue
+        parsed = urlparse(url)
+        raw = unquote(parsed.password or "")
+        if raw and not _invalid_password(raw):
+            return raw
+    return ""
+
+
+def _project_ref() -> str:
+    ref = _read_secret("SUPABASE_PROJECT_REF")
+    if ref:
+        return ref
+    for key in ("SUPABASE_DB_URL", "DATABASE_URL"):
         url = _read_secret(key)
         if url:
-            try:
-                return normalize_database_url(url)
-            except ValueError:
-                raise
-            except Exception as exc:
-                raise ValueError(
-                    f"Could not parse {key}. Check for special characters in the password "
-                    "(use SUPABASE_PASSWORD + SUPABASE_HOST instead). Details: {exc}"
-                ) from exc
-    built = _build_url_from_parts()
-    if built:
-        return built
-    return None
+            from urllib.parse import urlparse
+
+            parsed = urlparse(_clean_secret(url))
+            if parsed.username and parsed.username.startswith("postgres."):
+                return parsed.username.split(".", 1)[1]
+            if parsed.hostname:
+                found = _project_ref_from_host(parsed.hostname)
+                if found:
+                    return found
+    return ""
+
+
+def _region() -> str:
+    return _read_secret("SUPABASE_REGION") or "ap-southeast-1"
+
+
+def postgres_connect_candidates() -> list[dict[str, Any]]:
+    """Connection attempts ordered for Streamlit Cloud (session pooler first)."""
+    password = _postgres_password()
+    if _invalid_password(password):
+        return []
+
+    ref = _project_ref()
+    region = _region()
+    host_override = _read_secret("SUPABASE_HOST")
+    port_override = _read_secret("SUPABASE_PORT")
+    user_override = _read_secret("SUPABASE_USER")
+    dbname = _read_secret("SUPABASE_DB") or "postgres"
+
+    out: list[dict[str, Any]] = []
+    seen: set[tuple] = set()
+
+    def add(**kwargs: Any) -> None:
+        key = (kwargs.get("host"), kwargs.get("port"), kwargs.get("user"))
+        if key in seen:
+            return
+        seen.add(key)
+        out.append(kwargs)
+
+    if host_override:
+        add(
+            host=host_override,
+            port=int(port_override or 5432),
+            user=user_override or (f"postgres.{ref}" if ref else "postgres"),
+            password=password,
+            dbname=dbname,
+        )
+
+    if ref and region:
+        for prefix in ("aws-0", "aws-1"):
+            pooler = f"{prefix}-{region}.pooler.supabase.com"
+            add(
+                host=pooler,
+                port=5432,
+                user=f"postgres.{ref}",
+                password=password,
+                dbname=dbname,
+                label=f"Session pooler {pooler}:5432",
+            )
+            add(
+                host=pooler,
+                port=6543,
+                user=f"postgres.{ref}",
+                password=password,
+                dbname=dbname,
+                label=f"Transaction pooler {pooler}:6543",
+            )
+
+    if ref:
+        add(
+            host=f"db.{ref}.supabase.co",
+            port=5432,
+            user="postgres",
+            password=password,
+            dbname=dbname,
+            label="Direct (may not work on Streamlit Cloud)",
+        )
+
+    return out
 
 
 def use_supabase() -> bool:
-    return database_url() is not None
+    if _postgres_password() and not _invalid_password(_postgres_password()):
+        return True
+    if _read_secret("SUPABASE_HOST") and _postgres_password():
+        return True
+    if _project_ref() and _postgres_password():
+        return True
+    for key in ("SUPABASE_DB_URL", "DATABASE_URL", "POSTGRES_URL"):
+        if _read_secret(key):
+            return True
+    return False
+
+
+def database_url() -> Optional[str]:
+    """Legacy helper — prefer postgres_connect_candidates."""
+    cands = postgres_connect_candidates()
+    if not cands:
+        return None
+    c = cands[0]
+    from urllib.parse import quote
+
+    user = quote(str(c["user"]), safe="")
+    pw = quote(str(c["password"]), safe="")
+    host = c["host"]
+    port = c["port"]
+    db = c.get("dbname", "postgres")
+    return f"postgresql://{user}:{pw}@{host}:{port}/{db}?sslmode=require"
+
+
+def _connect_postgres() -> tuple[Any, str]:
+    """Try candidates; return (connection, label)."""
+    import psycopg
+    from psycopg.rows import dict_row
+
+    cands = postgres_connect_candidates()
+    if not cands:
+        raise ValueError(
+            "Supabase is not configured. In Streamlit secrets set:\n"
+            "SUPABASE_PROJECT_REF = jrtqpdjrsxnmsdxguqlg\n"
+            "SUPABASE_REGION = ap-southeast-1\n"
+            "SUPABASE_PASSWORD = (Database password from Supabase settings)\n\n"
+            "Run schema.sql in Supabase SQL Editor first."
+        )
+
+    errors: list[str] = []
+    for cand in cands:
+        label = cand.pop("label", f"{cand['host']}:{cand['port']}")
+        try:
+            conn = psycopg.connect(
+                host=cand["host"],
+                port=cand["port"],
+                user=cand["user"],
+                password=cand["password"],
+                dbname=cand.get("dbname", "postgres"),
+                sslmode="require",
+                connect_timeout=15,
+                row_factory=dict_row,
+                autocommit=False,
+            )
+            return conn, label
+        except Exception as exc:
+            errors.append(f"{label}: {type(exc).__name__}")
+
+    raise ValueError(
+        "Could not reach Supabase. Tried:\n- "
+        + "\n- ".join(errors)
+        + "\n\nCheck SUPABASE_PASSWORD (reset in Supabase → Database). "
+        "Copy the exact Session pooler host from Supabase → Connect → ORMs → "
+        "set SUPABASE_HOST + SUPABASE_USER + SUPABASE_PASSWORD + SUPABASE_PORT=5432. "
+        "Confirm schema.sql was run in SQL Editor."
+    )
 
 
 def _sqlite_path() -> Path:
@@ -214,8 +262,6 @@ def _sqlite_path() -> Path:
 
 
 class PgConnection:
-    """sqlite3-like wrapper around psycopg for store.py."""
-
     def __init__(self, conn: Any) -> None:
         self._conn = conn
 
@@ -232,34 +278,8 @@ class PgConnection:
 
 @contextmanager
 def open_connection() -> Iterator[Connection]:
-    url = database_url()
-    if url:
-        import psycopg
-        from psycopg import ProgrammingError
-        from psycopg.rows import dict_row
-
-        try:
-            conn = psycopg.connect(
-                url,
-                row_factory=dict_row,
-                autocommit=False,
-                connect_timeout=15,
-            )
-        except ProgrammingError as exc:
-            raise ValueError(
-                "Invalid Supabase connection string. Use Transaction pooler (port 6543) "
-                "or split secrets: SUPABASE_PROJECT_REF, SUPABASE_REGION, SUPABASE_PASSWORD."
-            ) from exc
-        except Exception as exc:
-            name = type(exc).__name__
-            hint = (
-                "Wrong database password, or direct db.*.supabase.co:5432 URL (use pooler 6543). "
-                "Easiest fix — set these in Streamlit secrets (no URL):\n"
-                "SUPABASE_PROJECT_REF = \"jrtqpdjrsxnmsdxguqlg\"\n"
-                "SUPABASE_REGION = \"ap-southeast-1\"\n"
-                "SUPABASE_PASSWORD = \"your-database-password\""
-            )
-            raise ValueError(f"Supabase connection failed ({name}). {hint}") from exc
+    if use_supabase():
+        conn, _label = _connect_postgres()
         wrapper = PgConnection(conn)
         try:
             yield wrapper

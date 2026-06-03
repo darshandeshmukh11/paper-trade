@@ -793,7 +793,27 @@ def main() -> None:
     if not _check_password():
         return
 
-    init_db()
+    try:
+        init_db()
+    except ValueError as exc:
+        st.error("Database connection failed")
+        for line in str(exc).split("\n"):
+            st.markdown(line)
+        with st.expander("Supabase setup checklist"):
+            st.markdown(
+                """
+1. **SQL Editor** → run `schema.sql` from this repo  
+2. **Streamlit secrets** (no URL needed):
+   ```
+   SUPABASE_PROJECT_REF = "jrtqpdjrsxnmsdxguqlg"
+   SUPABASE_REGION = "ap-southeast-1"
+   SUPABASE_PASSWORD = "your-database-password"
+   ```
+3. Password = **Database password** in Supabase (reset under Project Settings → Database)  
+4. Or copy **Session pooler** host from Supabase → **Connect** → set `SUPABASE_HOST`, `SUPABASE_USER`, `SUPABASE_PASSWORD`, `SUPABASE_PORT = "5432"`
+                """
+            )
+        st.stop()
     st.sidebar.title("Paper trading")
     st.sidebar.caption(f"INR · NSE/BSE · Storage: **{storage_label()}**")
     if st.sidebar.button("Refresh LTP / prices"):

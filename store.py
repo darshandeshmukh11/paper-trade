@@ -71,7 +71,24 @@ def _ensure_sqlite_schema(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE trades ADD COLUMN target_price REAL")
 
 
+def _postgres_tables_exist(conn: PgConnection) -> bool:
+    row = conn.execute(
+        """
+        SELECT EXISTS (
+            SELECT 1 FROM information_schema.tables
+            WHERE table_schema = 'public' AND table_name = 'trades'
+        )
+        """
+    ).fetchone()
+    data = row_to_dict(row)
+    return bool(data.get("exists"))
+
+
 def _ensure_postgres_schema(conn: PgConnection) -> None:
+    # Schema should be created via schema.sql in Supabase SQL Editor.
+    # Skip DDL on pooler if tables already exist (transaction mode dislikes DDL).
+    if _postgres_tables_exist(conn):
+        return
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS settings (
