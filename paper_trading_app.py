@@ -214,14 +214,14 @@ def _universe_for_index(index_filter: str, nse_universe: list[str]) -> list[str]
     return nse_universe
 
 
-@st.cache_data(ttl=30)
+@st.cache_data(ttl=90)
 def fetch_ltp(symbol: str, exchange: str = "NSE") -> Optional[float]:
     from live_price import fetch_live_price
 
     return fetch_live_price(symbol, exchange)
 
 
-@st.cache_data(ttl=30)
+@st.cache_data(ttl=90)
 def fetch_ltp_quote(symbol: str, exchange: str = "NSE"):
     from live_price import fetch_live_quote
 
@@ -328,10 +328,29 @@ def _pnl_metric(container, label: str, value: float, subtext: str = "") -> None:
         )
 
 
+def _fetch_quotes_parallel(positions: list) -> dict[str, object]:
+    """Fetch Yahoo quotes in parallel (much faster than one-by-one)."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    out: dict[str, object] = {}
+    if not positions:
+        return out
+
+    def _one(p) -> tuple[str, object]:
+        return p.symbol, fetch_ltp_quote(p.symbol, p.exchange)
+
+    workers = min(6, len(positions))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [pool.submit(_one, p) for p in positions]
+        for fut in as_completed(futures):
+            sym, quote = fut.result()
+            out[sym] = quote
+    return out
+
+
 def page_dashboard(conn, starting: float, trades_df: pd.DataFrame) -> None:
     st.caption(
-        "Open-position P&L uses **live LTP** (Yahoo `last_price` / market price, not stale 1m bars). "
-        "Refreshes ~30s · use **Refresh LTP / prices** in the sidebar. "
+        "Open-position P&L uses **live LTP** (Yahoo). Cached ~90s · **Refresh LTP / prices** in sidebar. "
         "**Total P&L** = cash + holdings at LTP − starting capital."
     )
     cash = cash_balance(starting, trades_df)
@@ -340,8 +359,9 @@ def page_dashboard(conn, starting: float, trades_df: pd.DataFrame) -> None:
     holdings_value = 0.0
     live_quote_count = 0
     pos_rows = []
+    quotes = _fetch_quotes_parallel(positions)
     for p in positions:
-        quote = fetch_ltp_quote(p.symbol, p.exchange)
+        quote = quotes.get(p.symbol)
         if quote is not None:
             ltp = quote.price
             live_quote_count += 1
@@ -440,25 +460,22 @@ def page_new_trade(conn, starting: float, trades_df: pd.DataFrame, cs: ChargeSet
         if search.strip():
             label = f"Matches for «{search.strip().upper()}» ({len(picker_options)})"
         elif index_filter == "All NSE":
-            label = f"Symbol — all {len(active_universe):,} NSE equities"
+            label = f"Symbol — popular + search ({len(active_universe):,} NSE available)"
         else:
             label = f"Symbol — {index_filter} ({len(active_universe)} stocks)"
         symbol = st.selectbox(
             label,
-            options=picker_options if picker_options else active_universe[:1],
+            options=picker_options if picker_options else ["RELIANCE"],
             index=0,
         )
+        if not search.strip():
+            st.caption("Type in **Symbol search** to find any NSE ticker (list is capped for speed).")
         if search.strip() and picker_options:
             st.caption(f"Top match: **{picker_options[0]}**")
     with ex_col:
         exchange = st.selectbox("Exchange", ["NSE", "BSE"], help="BSE: use BSE ticker; Yahoo suffix .BO")
 
-    ltp_q = fetch_ltp_quote(symbol, exchange)
-    if ltp_q is not None:
-        st.caption(f"Live price **₹{ltp_q.price:,.2f}** · {ltp_q.source}")
-
-    default_price = float(ltp_q.price) if ltp_q is not None else 1000.0
-
+    default_price = 1000.0
     with st.form("new_trade", clear_on_submit=True):
         c2, c3 = st.columns(2)
         with c2:
@@ -467,6 +484,7 @@ def page_new_trade(conn, starting: float, trades_df: pd.DataFrame, cs: ChargeSet
         with c3:
             qty = st.number_input("Quantity", min_value=1, value=10, step=1)
             price = st.number_input("Price (₹)", min_value=0.01, value=default_price, step=0.05)
+        st.caption("Tip: open **Dashboard** and use **Refresh LTP** to see live prices (fetched on demand).")
 
         c4, c5 = st.columns(2)
         with c4:

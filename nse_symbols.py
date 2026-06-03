@@ -209,12 +209,14 @@ def search_nse_symbols(query: str, universe: Optional[list[str]] = None, limit: 
     return out[:limit]
 
 
-def symbol_picker_options(query: str, universe: list[str]) -> list[str]:
-    """Options for the symbol selectbox: full NSE list, or filtered matches."""
+def symbol_picker_options(query: str, universe: list[str], limit: int = 80) -> list[str]:
+    """Options for the symbol selectbox (capped — never the full NSE list)."""
     q = query.strip().upper()
     if not q:
-        popular = [s for s in POPULAR_NSE_SYMBOLS if s in set(universe)]
+        universe_set = set(universe)
+        popular = [s for s in POPULAR_NSE_SYMBOLS if s in universe_set]
         if popular:
-            return popular + [s for s in universe if s not in popular][: max(0, 80 - len(popular))]
-        return universe
-    return search_nse_symbols(q, universe, limit=300)
+            rest = [s for s in universe if s not in popular][: max(0, limit - len(popular))]
+            return popular + rest
+        return universe[:limit]
+    return search_nse_symbols(q, universe, limit=min(300, limit * 4))

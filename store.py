@@ -84,10 +84,30 @@ def _postgres_tables_exist(conn: PgConnection) -> bool:
     return bool(data.get("exists"))
 
 
+def _schema_check_done() -> bool:
+    try:
+        import streamlit as st
+
+        return bool(st.session_state.get("pg_schema_ok"))
+    except Exception:
+        return False
+
+
+def _mark_schema_check_done() -> None:
+    try:
+        import streamlit as st
+
+        st.session_state["pg_schema_ok"] = True
+    except Exception:
+        pass
+
+
 def _ensure_postgres_schema(conn: PgConnection) -> None:
     # Schema should be created via schema.sql in Supabase SQL Editor.
-    # Skip DDL on pooler if tables already exist (transaction mode dislikes DDL).
+    if _schema_check_done():
+        return
     if _postgres_tables_exist(conn):
+        _mark_schema_check_done()
         return
     conn.execute(
         """
@@ -121,6 +141,7 @@ def _ensure_postgres_schema(conn: PgConnection) -> None:
     )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_symbol ON trades (symbol)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_position ON trades (position_id)")
+    _mark_schema_check_done()
 
 
 def _seed_defaults(conn: Connection) -> None:
@@ -146,9 +167,7 @@ def _seed_defaults(conn: Connection) -> None:
 def init_db(path: Optional[Path] = None) -> Union[Path, str]:
     """Ensure schema exists. Returns display label for sidebar."""
     if use_supabase():
-        with open_connection() as conn:
-            _ensure_postgres_schema(conn)
-            _seed_defaults(conn)
+        # Avoid a separate DB round-trip here; connect() handles setup once per rerun.
         return "Supabase (PostgreSQL)"
 
     db = path or _sqlite_path()

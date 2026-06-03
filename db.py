@@ -210,12 +210,33 @@ def database_url() -> Optional[str]:
     return f"postgresql://{user}:{pw}@{host}:{port}/{db}?sslmode=require"
 
 
+def _session_pooler_candidate() -> Optional[dict[str, Any]]:
+    try:
+        import streamlit as st
+
+        return st.session_state.get("supabase_pooler_cand")
+    except Exception:
+        return None
+
+
+def _remember_pooler_candidate(cand: dict[str, Any]) -> None:
+    try:
+        import streamlit as st
+
+        st.session_state["supabase_pooler_cand"] = {
+            k: v for k, v in cand.items() if k != "label"
+        }
+    except Exception:
+        pass
+
+
 def _connect_postgres() -> tuple[Any, str]:
-    """Try candidates; return (connection, label)."""
+    """Try candidates; return (connection, label). Reuses working pooler in session."""
     import psycopg
     from psycopg.rows import dict_row
 
-    cands = postgres_connect_candidates()
+    cached = _session_pooler_candidate()
+    cands = [dict(cached, label="cached pooler")] if cached else postgres_connect_candidates()
     if not cands:
         raise ValueError(
             "Supabase is not configured. In Streamlit secrets set:\n"
@@ -236,10 +257,11 @@ def _connect_postgres() -> tuple[Any, str]:
                 password=cand["password"],
                 dbname=cand.get("dbname", "postgres"),
                 sslmode="require",
-                connect_timeout=15,
+                connect_timeout=8,
                 row_factory=dict_row,
                 autocommit=False,
             )
+            _remember_pooler_candidate(cand)
             return conn, label
         except Exception as exc:
             errors.append(f"{label}: {type(exc).__name__}")
