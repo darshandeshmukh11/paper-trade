@@ -77,21 +77,110 @@ def cash_balance(starting_capital: float, trades_df: pd.DataFrame) -> float:
     return starting_capital + float(trades_df["net_cash"].sum())
 
 
-def _round_trip_pnl(grp: pd.DataFrame) -> float:
-    """Net P&L for a matched buy/sell group (by position_id)."""
-    buys = grp[grp["side"].str.upper() == "BUY"]
-    sells = grp[grp["side"].str.upper() == "SELL"]
-    if buys.empty or sells.empty:
-        return 0.0
-    bqty = int(buys["qty"].sum())
-    sqty = int(sells["qty"].sum())
-    qty = min(bqty, sqty)
-    if qty <= 0:
-        return 0.0
-    buy_avg = float((buys["qty"] * buys["price"]).sum() / bqty)
-    sell_avg = float((sells["qty"] * sells["price"]).sum() / sqty)
-    charges = float(grp["charges"].sum())
-    return (sell_avg - buy_avg) * qty - charges
+def _fifo_completed_cycles(sym_trades: pd.DataFrame, position_id: str | None) -> list[dict[str, Any]]:
+    """Each sell matched to prior buys (FIFO) yields one completed round-trip row."""
+    if sym_trades.empty:
+        return []
+
+    symbol = str(sym_trades["symbol"].iloc[0]).upper()
+    lots: list[dict[str, Any]] = []
+    cycles: list[dict[str, Any]] = []
+    chron = sym_trades.sort_values(["traded_at", "id"])
+
+    for _, row in chron.iterrows():
+        side = str(row["side"]).upper()
+        qty = int(row["qty"])
+        price = float(row["price"])
+        charges = float(row.get("charges", 0.0) or 0.0)
+        traded_at = row["traded_at"]
+
+        if side == "BUY":
+            lots.append(
+                {
+                    "qty": qty,
+                    "price": price,
+                    "charges": charges,
+                    "traded_at": traded_at,
+                }
+            )
+            continue
+        if side != "SELL":
+            continue
+
+        remaining = qty
+        sell_charges = charges
+        sell_date = traded_at
+        while remaining > 0 and lots:
+            lot = lots[0]
+            match = min(remaining, int(lot["qty"]))
+            if match <= 0:
+                break
+            buy_charge_alloc = lot["charges"] * (match / lot["qty"]) if lot["qty"] else 0.0
+            sell_charge_alloc = sell_charges * (match / qty) if qty else 0.0
+            pnl_inr = (price - lot["price"]) * match - buy_charge_alloc - sell_charge_alloc
+            cost_basis = lot["price"] * match
+            return_pct = (pnl_inr / cost_basis * 100.0) if cost_basis else 0.0
+            cycles.append(
+                {
+                    "symbol": symbol,
+                    "position_id": position_id or "",
+                    "qty": match,
+                    "buy_avg": round(lot["price"], 2),
+                    "sell_avg": round(price, 2),
+                    "buy_date": lot["traded_at"],
+                    "sell_date": sell_date,
+                    "pnl_inr": round(pnl_inr, 2),
+                    "return_pct": round(return_pct, 2),
+                    "charges": round(buy_charge_alloc + sell_charge_alloc, 2),
+                }
+            )
+            lot["qty"] -= match
+            lot["charges"] -= buy_charge_alloc
+            remaining -= match
+            if lot["qty"] <= 0:
+                lots.pop(0)
+    return cycles
+
+
+def completed_round_trips(trades_df: pd.DataFrame) -> pd.DataFrame:
+    """Closed buy→sell cycles with realized P&L and return % (FIFO; position_id groups isolated)."""
+    columns = [
+        "symbol",
+        "position_id",
+        "qty",
+        "buy_avg",
+        "sell_avg",
+        "buy_date",
+        "sell_date",
+        "pnl_inr",
+        "return_pct",
+        "charges",
+    ]
+    if trades_df.empty:
+        return pd.DataFrame(columns=columns)
+
+    rows: list[dict[str, Any]] = []
+    pid_series = (
+        trades_df["position_id"].fillna("").astype(str).str.strip()
+        if "position_id" in trades_df.columns
+        else pd.Series([""] * len(trades_df))
+    )
+    with_pid = trades_df[pid_series != ""]
+    without_pid = trades_df[pid_series == ""]
+
+    for pid, grp in with_pid.groupby("position_id"):
+        rows.extend(_fifo_completed_cycles(grp, str(pid)))
+
+    if not without_pid.empty:
+        chron = without_pid.sort_values(["traded_at", "id"])
+        for _, grp in chron.groupby(chron["symbol"].str.upper()):
+            rows.extend(_fifo_completed_cycles(grp, None))
+
+    if not rows:
+        return pd.DataFrame(columns=columns)
+
+    out = pd.DataFrame(rows)
+    return out.sort_values(["sell_date", "symbol"], ascending=[False, True]).reset_index(drop=True)
 
 
 def _fifo_realized_pnl(trades_df: pd.DataFrame) -> float:
@@ -101,34 +190,9 @@ def _fifo_realized_pnl(trades_df: pd.DataFrame) -> float:
 
     total = 0.0
     chron = trades_df.sort_values(["traded_at", "id"])
-    for symbol, sym_trades in chron.groupby(chron["symbol"].str.upper()):
-        lots: list[dict[str, float]] = []
-        for _, row in sym_trades.iterrows():
-            side = str(row["side"]).upper()
-            qty = int(row["qty"])
-            price = float(row["price"])
-            charges = float(row.get("charges", 0.0) or 0.0)
-            if side == "BUY":
-                lots.append({"qty": qty, "price": price, "charges": charges})
-                continue
-            if side != "SELL":
-                continue
-
-            remaining = qty
-            sell_charges = charges
-            while remaining > 0 and lots:
-                lot = lots[0]
-                match = min(remaining, int(lot["qty"]))
-                if match <= 0:
-                    break
-                buy_charge_alloc = lot["charges"] * (match / lot["qty"]) if lot["qty"] else 0.0
-                sell_charge_alloc = sell_charges * (match / qty) if qty else 0.0
-                total += (price - lot["price"]) * match - buy_charge_alloc - sell_charge_alloc
-                lot["qty"] -= match
-                lot["charges"] -= buy_charge_alloc
-                remaining -= match
-                if lot["qty"] <= 0:
-                    lots.pop(0)
+    for _, sym_trades in chron.groupby(chron["symbol"].str.upper()):
+        for cycle in _fifo_completed_cycles(sym_trades, None):
+            total += float(cycle["pnl_inr"])
     return total
 
 
@@ -147,8 +211,9 @@ def realized_pnl(trades_df: pd.DataFrame) -> float:
         pid_series = trades_df["position_id"].fillna("").astype(str).str.strip()
         with_pid = trades_df[pid_series != ""]
         fifo_df = trades_df[pid_series == ""]
-        for _, grp in with_pid.groupby("position_id"):
-            total += _round_trip_pnl(grp)
+        for pid, grp in with_pid.groupby("position_id"):
+            for cycle in _fifo_completed_cycles(grp, str(pid)):
+                total += float(cycle["pnl_inr"])
 
     total += _fifo_realized_pnl(fifo_df)
     return total
