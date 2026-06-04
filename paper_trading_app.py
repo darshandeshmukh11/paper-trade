@@ -561,17 +561,12 @@ def _fetch_quotes_parallel(positions: list) -> dict[str, object]:
     return out
 
 
-def page_dashboard(conn, starting: float, trades_df: pd.DataFrame) -> None:
-    st.caption(
-        "Open-position P&L uses **live LTP** (Yahoo). Cached ~90s · **Refresh LTP / prices** in sidebar. "
-        "**Total P&L** = cash + holdings at LTP − starting capital."
-    )
-    cash = cash_balance(starting, trades_df)
-    positions = compute_positions(trades_df)
+def _build_open_position_rows(positions: list) -> tuple[list[dict], float, float, int]:
+    """Live LTP rows plus unrealized MTM and holdings value."""
     mtm = 0.0
     holdings_value = 0.0
     live_quote_count = 0
-    pos_rows = []
+    pos_rows: list[dict] = []
     quotes = _fetch_quotes_parallel(positions)
     for p in positions:
         quote = quotes.get(p.symbol)
@@ -597,7 +592,41 @@ def page_dashboard(conn, starting: float, trades_df: pd.DataFrame) -> None:
                 "Unrealized P&L": round(upl, 2),
             }
         )
+    return pos_rows, mtm, holdings_value, live_quote_count
 
+
+def _render_open_positions_section(
+    pos_rows: list[dict],
+    positions: list,
+    live_quote_count: int,
+) -> None:
+    st.subheader("Open positions")
+    if pos_rows:
+        st.dataframe(
+            _style_open_positions_table(pd.DataFrame(pos_rows)),
+            use_container_width=True,
+            hide_index=True,
+        )
+        if live_quote_count < len(positions):
+            st.warning(
+                f"Live LTP for {live_quote_count}/{len(positions)} positions — "
+                "others use avg cost until Yahoo returns a price. Use **Refresh LTP** in the sidebar."
+            )
+    else:
+        st.info("No open positions. Place a BUY from the **New trade** tab.")
+
+
+def page_dashboard(conn, starting: float, trades_df: pd.DataFrame) -> None:
+    positions = compute_positions(trades_df)
+    pos_rows, mtm, holdings_value, live_quote_count = _build_open_position_rows(positions)
+    _render_open_positions_section(pos_rows, positions, live_quote_count)
+
+    st.caption(
+        "Open-position P&L uses **live LTP** (Yahoo). Cached ~90s · **Refresh LTP / prices** in sidebar. "
+        "**Total P&L** = cash + holdings at LTP − starting capital."
+    )
+
+    cash = cash_balance(starting, trades_df)
     realized = realized_pnl(trades_df) if not trades_df.empty else 0.0
     equity = cash + holdings_value
 
@@ -622,22 +651,6 @@ def page_dashboard(conn, starting: float, trades_df: pd.DataFrame) -> None:
     _render_turnover_and_tax(trades_df, closed_df, total_pnl)
 
     _render_returns_section(perf, show_cycles_table=True, cycles_expanded=False)
-
-    if positions and live_quote_count < len(positions):
-        st.warning(
-            f"Live LTP for {live_quote_count}/{len(positions)} positions — "
-            "others use avg cost until Yahoo returns a price. Use **Refresh LTP** in the sidebar."
-        )
-
-    if pos_rows:
-        st.subheader("Open positions")
-        st.dataframe(
-            _style_open_positions_table(pd.DataFrame(pos_rows)),
-            use_container_width=True,
-            hide_index=True,
-        )
-    else:
-        st.info("No open positions. Place a BUY from the **New trade** tab.")
 
 
 def page_new_trade(conn, starting: float, trades_df: pd.DataFrame, cs: ChargeSettings) -> None:
