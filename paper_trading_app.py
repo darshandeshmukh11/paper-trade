@@ -709,7 +709,10 @@ def page_new_trade(conn, starting: float, trades_df: pd.DataFrame, cs: ChargeSet
     with ex_col:
         exchange = st.selectbox("Exchange", ["NSE", "BSE"], help="BSE: use BSE ticker; Yahoo suffix .BO")
 
-    default_price = 1000.0
+    sym = normalize_nse_symbol(symbol)
+    ltp = fetch_ltp(sym, exchange)
+    default_price = round(ltp, 2) if ltp is not None else 1000.0
+
     with st.form("new_trade", clear_on_submit=True):
         c2, c3 = st.columns(2)
         with c2:
@@ -718,7 +721,16 @@ def page_new_trade(conn, starting: float, trades_df: pd.DataFrame, cs: ChargeSet
         with c3:
             qty = st.number_input("Quantity", min_value=1, value=10, step=1)
             price = st.number_input("Price (₹)", min_value=0.01, value=default_price, step=0.05)
-        st.caption("Tip: open **Dashboard** and use **Refresh LTP** to see live prices (fetched on demand).")
+        if ltp is not None:
+            st.caption(
+                f"**Live LTP** for **{sym}** ({exchange}) — ₹{default_price:,.2f}. "
+                "Updates when you change symbol or exchange. Use **Refresh LTP / prices** in the sidebar to force refresh."
+            )
+        else:
+            st.warning(
+                f"Could not fetch live price for **{sym}** ({exchange}). "
+                "Enter price manually or use **Refresh LTP / prices** in the sidebar."
+            )
 
         c4, c5 = st.columns(2)
         with c4:
@@ -759,7 +771,6 @@ def page_new_trade(conn, starting: float, trades_df: pd.DataFrame, cs: ChargeSet
         )
         return
 
-    sym = normalize_nse_symbol(symbol)
     if exchange == "NSE" and sym not in nse_universe:
         st.warning(
             f"**{sym}** is not in the cached NSE list — order will still be saved. "
