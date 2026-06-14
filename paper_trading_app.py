@@ -997,7 +997,6 @@ def _style_completed_cycles_table(df: pd.DataFrame):
             "charges": "Charges",
         }
     )
-    styler = display.style.set_table_styles(dark_table)
     # Win/Loss badge column
     if "P&L ₹" in display.columns:
         display["Outcome"] = display["P&L ₹"].apply(lambda x: "Win" if float(x) > 0 else ("Loss" if float(x) < 0 else "Even"))
@@ -1009,6 +1008,8 @@ def _style_completed_cycles_table(df: pd.DataFrame):
             display = display[cols]
         except ValueError:
             pass
+    # create Styler after we've finished mutating `display`
+    styler = display.style.set_table_styles(dark_table)
     pct_cols = ["Abs. return %", "Return %", "CAGR %"]
     for col in pct_cols:
         if col in display.columns:
@@ -1016,10 +1017,11 @@ def _style_completed_cycles_table(df: pd.DataFrame):
                 styler = styler.map(_color_return_pct_cell, subset=[col])
             else:
                 styler = styler.applymap(_color_return_pct_cell, subset=[col])
-    if hasattr(styler, "map"):
-        styler = styler.map(_color_pnl_cell, subset=["P&L ₹"])
-    else:
-        styler = styler.applymap(_color_pnl_cell, subset=["P&L ₹"])
+    if "P&L ₹" in display.columns:
+        if hasattr(styler, "map"):
+            styler = styler.map(_color_pnl_cell, subset=["P&L ₹"])
+        else:
+            styler = styler.applymap(_color_pnl_cell, subset=["P&L ₹"])
     # Style Outcome badges
     def _outcome_style(val: object) -> str:
         try:
