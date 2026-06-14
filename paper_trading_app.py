@@ -305,6 +305,7 @@ def _style_open_positions_table(df: pd.DataFrame):
             "LTP": "₹{:,.2f}",
             "Market value": "₹{:,.2f}",
             "Unrealized P&L": "₹{:+,.2f}",
+            "Days held": lambda x: _human_days(float(x)) if x is not None else "—",
         }
     )
 
@@ -315,6 +316,26 @@ def _fmt_pct(value: Optional[float], signed: bool = True) -> str:
     if signed:
         return f"{value:+.2f}%"
     return f"{value:.2f}%"
+
+
+def _human_days(days: float) -> str:
+    """Format days as human-friendly string: '3d', '2w', '1y', or '<1d'."""
+    try:
+        d = float(days)
+    except Exception:
+        return "—"
+    if d < 1:
+        return "<1d"
+    if d < 7:
+        return f"{int(round(d))}d"
+    if d < 30:
+        weeks = int(round(d / 7))
+        return f"{weeks}w"
+    if d < 365:
+        months = int(round(d / 30))
+        return f"{months}m"
+    years = int(round(d / 365))
+    return f"{years}y"
 
 
 def _metric_pct(container, label: str, value: Optional[float], subtext: str = "") -> None:
@@ -372,6 +393,8 @@ def _build_performance_context(
 
 def _render_returns_section(
     perf: dict,
+    trades_df: Optional[pd.DataFrame] = None,
+    starting: Optional[float] = None,
     *,
     show_cycles_table: bool = True,
     cycles_expanded: bool = False,
@@ -416,6 +439,38 @@ def _render_returns_section(
 
     if not show_cycles_table:
         return
+
+    # Equity curve and portfolio-level diagnostics (if trades + starting provided)
+    if trades_df is not None and starting is not None:
+        closed_df = perf.get("closed_df")
+        eq_df = _compute_equity_timeline(trades_df, starting)
+        if not eq_df.empty:
+            st.markdown("#### Equity curve & portfolio diagnostics")
+            c1, c2 = st.columns([3, 1])
+            with c1:
+                st.line_chart(eq_df["equity"], use_container_width=True)
+            with c2:
+                # terminal equity
+                last_equity = float(eq_df["equity"].iloc[-1])
+                total_pnl = last_equity - starting
+                realized = realized_pnl(trades_df) if not trades_df.empty else 0.0
+                unrealized = total_pnl - realized
+                # Max drawdown
+                mdd = _max_drawdown_pct(eq_df["equity"])
+                # Win rate
+                wr = _win_rate_pct(closed_df)
+
+                _pnl_metric(st.container(), "Realized P&L", realized)
+                _pnl_metric(st.container(), "Unrealized P&L", unrealized)
+                _metric_pct(st.container(), "Max drawdown", mdd, "Peak-to-trough %")
+                if wr is not None:
+                    # color positive win rate green
+                    color = PNL_COLOR_PROFIT if wr > 0 else PNL_COLOR_NEUTRAL
+                    st.markdown(
+                        f'<p style="margin:0;font-size:0.875rem;color:{PNL_COLOR_LABEL};">Win rate</p>'
+                        f'<p style="margin:0;font-size:1.25rem;font-weight:700;color:{color};">{wr:.2f}%</p>',
+                        unsafe_allow_html=True,
+                    )
 
     closed_df = perf.get("closed_df")
     if closed_df is None or closed_df.empty:
@@ -561,8 +616,65 @@ def _fetch_quotes_parallel(positions: list) -> dict[str, object]:
     return out
 
 
-def _build_open_position_rows(positions: list) -> tuple[list[dict], float, float, int]:
-    """Live LTP rows plus unrealized MTM and holdings value."""
+
+def _open_position_hold_days(symbol: str, target_qty: int, trades_df: pd.DataFrame) -> float:
+    """Estimate days held for open position using FIFO remaining lots.
+
+    Returns number of calendar days since oldest remaining buy lot (0 if unknown).
+    """
+    if trades_df is None or trades_df.empty or target_qty <= 0:
+        return 0
+    chron = trades_df.sort_values(["traded_at", "id"]) 
+    sym_trades = chron[chron["symbol"].str.upper() == symbol.upper()]
+    if sym_trades.empty:
+        return 0
+
+    lots: list[dict] = []
+    for _, row in sym_trades.iterrows():
+        side = str(row["side"]).upper()
+        qty = int(row["qty"])
+        price = float(row["price"])
+        traded_at = row["traded_at"]
+        if side == "BUY":
+            lots.append({"qty": qty, "price": price, "traded_at": traded_at})
+            continue
+        if side == "SELL":
+            remaining = qty
+            while remaining > 0 and lots:
+                lot = lots[0]
+                match = min(remaining, int(lot["qty"]))
+                lot["qty"] -= match
+                remaining -= match
+                if lot["qty"] <= 0:
+                    lots.pop(0)
+            # if sells exceed buys, we just drop
+
+    # after processing, lots are remaining open lots
+    rem_qty = sum(int(l["qty"]) for l in lots)
+    if rem_qty <= 0:
+        return 0
+    # compute weighted-average days held across remaining lots
+    now = pd.Timestamp.now(tz="UTC")
+    weighted_days = 0.0
+    total_qty = 0
+    for lot in lots:
+        q = int(lot["qty"])
+        if q <= 0:
+            continue
+        ts = pd.to_datetime(lot["traded_at"], utc=True, errors="coerce")
+        if pd.isna(ts):
+            continue
+        days = max((now - ts).days, 0)
+        weighted_days += days * q
+        total_qty += q
+    if total_qty <= 0:
+        return 0
+    avg_days = weighted_days / total_qty
+    return float(avg_days)
+
+
+def _build_open_position_rows(positions: list, trades_df: pd.DataFrame | None = None) -> tuple[list[dict], float, float, int]:
+    """Live LTP rows plus unrealized MTM and holdings value. Optionally compute Days held from trades_df."""
     mtm = 0.0
     holdings_value = 0.0
     live_quote_count = 0
@@ -581,6 +693,7 @@ def _build_open_position_rows(positions: list) -> tuple[list[dict], float, float
         upl = mv - p.cost_basis
         mtm += upl
         holdings_value += mv
+        days_held = _open_position_hold_days(p.symbol, p.qty, trades_df) if trades_df is not None else 0.0
         pos_rows.append(
             {
                 "Symbol": p.symbol,
@@ -590,6 +703,7 @@ def _build_open_position_rows(positions: list) -> tuple[list[dict], float, float
                 "Quote": quote_note,
                 "Market value": round(mv, 2),
                 "Unrealized P&L": round(upl, 2),
+                "Days held": float(days_held),
             }
         )
     return pos_rows, mtm, holdings_value, live_quote_count
@@ -618,7 +732,7 @@ def _render_open_positions_section(
 
 def page_dashboard(conn, starting: float, trades_df: pd.DataFrame) -> None:
     positions = compute_positions(trades_df)
-    pos_rows, mtm, holdings_value, live_quote_count = _build_open_position_rows(positions)
+    pos_rows, mtm, holdings_value, live_quote_count = _build_open_position_rows(positions, trades_df)
     _render_open_positions_section(pos_rows, positions, live_quote_count)
 
     st.caption(
@@ -650,7 +764,7 @@ def page_dashboard(conn, starting: float, trades_df: pd.DataFrame) -> None:
         closed_df = pd.DataFrame()
     _render_turnover_and_tax(trades_df, closed_df, total_pnl)
 
-    _render_returns_section(perf, show_cycles_table=True, cycles_expanded=False)
+    _render_returns_section(perf, trades_df=trades_df, starting=starting, show_cycles_table=True, cycles_expanded=False)
 
 
 def page_new_trade(conn, starting: float, trades_df: pd.DataFrame, cs: ChargeSettings) -> None:
@@ -884,6 +998,17 @@ def _style_completed_cycles_table(df: pd.DataFrame):
         }
     )
     styler = display.style.set_table_styles(dark_table)
+    # Win/Loss badge column
+    if "P&L ₹" in display.columns:
+        display["Outcome"] = display["P&L ₹"].apply(lambda x: "Win" if float(x) > 0 else ("Loss" if float(x) < 0 else "Even"))
+        # Place Outcome after Symbol
+        cols = list(display.columns)
+        # move Outcome to be right after Symbol
+        try:
+            cols.insert(1, cols.pop(cols.index("Outcome")))
+            display = display[cols]
+        except ValueError:
+            pass
     pct_cols = ["Abs. return %", "Return %", "CAGR %"]
     for col in pct_cols:
         if col in display.columns:
@@ -895,6 +1020,23 @@ def _style_completed_cycles_table(df: pd.DataFrame):
         styler = styler.map(_color_pnl_cell, subset=["P&L ₹"])
     else:
         styler = styler.applymap(_color_pnl_cell, subset=["P&L ₹"])
+    # Style Outcome badges
+    def _outcome_style(val: object) -> str:
+        try:
+            s = str(val)
+        except Exception:
+            return ""
+        if s == "Win":
+            return f"background-color: {PNL_COLOR_PROFIT}; color: #071f04; font-weight:700; text-align:center"
+        if s == "Loss":
+            return f"background-color: {PNL_COLOR_LOSS}; color: #2a0505; font-weight:700; text-align:center"
+        return "background-color: transparent; color: #d4d4d8"
+
+    if "Outcome" in display.columns:
+        if hasattr(styler, "map"):
+            styler = styler.map(_outcome_style, subset=["Outcome"])
+        else:
+            styler = styler.applymap(_outcome_style, subset=["Outcome"])
     fmt = {
         "Buy avg": "₹{:,.2f}",
         "Sell avg": "₹{:,.2f}",
@@ -907,6 +1049,66 @@ def _style_completed_cycles_table(df: pd.DataFrame):
     if "CAGR %" in display.columns:
         fmt["CAGR %"] = "{:+.2f}%"
     return styler.format(fmt, na_rep="—")
+
+
+def _compute_equity_timeline(trades_df: pd.DataFrame, starting_capital: float) -> pd.DataFrame:
+    """Compute simple equity timeline at each trade date using cost-basis for holdings."""
+    if trades_df.empty:
+        return pd.DataFrame(columns=["date", "equity"]).set_index("date")
+    chron = trades_df.sort_values(["traded_at", "id"]).copy()
+    cash = starting_capital
+    positions: dict[str, dict] = {}
+    rows = []
+    for _, row in chron.iterrows():
+        side = str(row["side"]).upper()
+        sym = str(row["symbol"]).upper()
+        qty = int(row["qty"])
+        price = float(row["price"])
+        net = float(row.get("net_cash", 0.0))
+        # update cash using net_cash recorded (includes charges)
+        cash += net
+        if sym not in positions:
+            positions[sym] = {"qty": 0, "cost_basis": 0.0}
+        p = positions[sym]
+        if side == "BUY":
+            p["qty"] += qty
+            p["cost_basis"] += qty * price
+        elif side == "SELL":
+            # reduce qty and cost basis FIFO-ish using average cost
+            if p["qty"] <= 0:
+                # nothing to reduce
+                pass
+            else:
+                avg = p["cost_basis"] / p["qty"] if p["qty"] else 0.0
+                remove = min(qty, p["qty"])
+                p["cost_basis"] -= avg * remove
+                p["qty"] -= remove
+        holdings_value = sum(v["cost_basis"] for v in positions.values())
+        equity = cash + holdings_value
+        rows.append({"date": pd.to_datetime(row["traded_at"]), "equity": equity})
+    df = pd.DataFrame(rows).drop_duplicates(subset=["date"]).set_index("date").sort_index()
+    # include starting point
+    start_dt = pd.to_datetime(chron.iloc[0]["traded_at"]) - pd.Timedelta(seconds=1)
+    start_row = pd.DataFrame([{"date": start_dt, "equity": starting_capital}]).set_index("date")
+    df = pd.concat([start_row, df])
+    return df
+
+
+def _max_drawdown_pct(equity_series: pd.Series) -> float:
+    if equity_series.empty:
+        return 0.0
+    roll_max = equity_series.cummax()
+    drawdown = (equity_series - roll_max) / roll_max
+    mdd = drawdown.min() * 100.0
+    return float(mdd)
+
+
+def _win_rate_pct(closed_df: pd.DataFrame) -> Optional[float]:
+    if closed_df is None or closed_df.empty:
+        return None
+    wins = (closed_df["pnl_inr"] > 0).sum()
+    total = len(closed_df)
+    return float(wins / total * 100.0)
 
 
 def page_risk_reward() -> None:
@@ -981,6 +1183,8 @@ def page_history(conn) -> None:
     perf = _build_performance_context(starting, trades_df, use_live_ltp=True)
     _render_returns_section(
         perf,
+        trades_df=trades_df,
+        starting=starting,
         show_cycles_table=True,
         cycles_expanded=True,
         use_styled_cycles=True,
