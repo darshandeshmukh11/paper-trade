@@ -250,6 +250,124 @@ def _display_optional_price(value: object) -> str:
     return _fmt_inr(num) if num > 0 else "—"
 
 
+def _positive_optional_float(value: object) -> float | None:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return None
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        return None
+    return num if num > 0 else None
+
+
+def _lot_key(row: pd.Series) -> tuple[str, str]:
+    position_id = str(row.get("position_id") or "").strip()
+    if position_id:
+        return (str(row["symbol"]).upper(), position_id)
+    return (str(row["symbol"]).upper(), "")
+
+
+def _open_exit_order_lots(trades_df: pd.DataFrame) -> list[dict]:
+    """Return remaining BUY lots that still carry a stop loss or target price."""
+    if trades_df.empty:
+        return []
+
+    chron = trades_df.sort_values(["traded_at", "id"])
+    lots_by_key: dict[tuple[str, str], list[dict]] = {}
+
+    for _, row in chron.iterrows():
+        side = str(row["side"]).upper()
+        key = _lot_key(row)
+        qty = int(row["qty"])
+
+        if side == "BUY":
+            stop_loss = _positive_optional_float(row.get("stop_loss"))
+            target_price = _positive_optional_float(row.get("target_price"))
+            if stop_loss is None and target_price is None:
+                continue
+            lots_by_key.setdefault(key, []).append(
+                {
+                    "qty": qty,
+                    "symbol": str(row["symbol"]).upper(),
+                    "exchange": row.get("exchange", "NSE") or "NSE",
+                    "segment": row.get("segment", "Equity Delivery") or "Equity Delivery",
+                    "position_id": str(row.get("position_id") or "").strip() or None,
+                    "stop_loss": stop_loss,
+                    "target_price": target_price,
+                    "buy_trade_id": int(row["id"]),
+                }
+            )
+            continue
+
+        if side != "SELL":
+            continue
+
+        remaining_sell_qty = qty
+        sell_key_candidates = [key]
+        if key[1] == "":
+            sell_key_candidates = [k for k in lots_by_key if k[0] == key[0] and k[1] == ""]
+
+        for sell_key in sell_key_candidates:
+            lots = lots_by_key.get(sell_key, [])
+            while lots and remaining_sell_qty > 0:
+                match = min(lots[0]["qty"], remaining_sell_qty)
+                lots[0]["qty"] -= match
+                remaining_sell_qty -= match
+                if lots[0]["qty"] <= 0:
+                    lots.pop(0)
+            if remaining_sell_qty <= 0:
+                break
+
+    return [lot for lots in lots_by_key.values() for lot in lots if lot["qty"] > 0]
+
+
+def _auto_execute_exit_orders(conn, trades_df: pd.DataFrame, cs: ChargeSettings) -> list[str]:
+    """Create SELL trades when live LTP reaches a BUY lot's stop loss or target."""
+    executed: list[str] = []
+    now = datetime.now(IST)
+
+    for lot in _open_exit_order_lots(trades_df):
+        ltp = fetch_ltp(lot["symbol"], lot["exchange"])
+        if ltp is None:
+            continue
+
+        trigger_name = None
+        trigger_price = None
+        if lot["stop_loss"] is not None and float(ltp) <= lot["stop_loss"]:
+            trigger_name = "stop loss"
+            trigger_price = lot["stop_loss"]
+        elif lot["target_price"] is not None and float(ltp) >= lot["target_price"]:
+            trigger_name = "target"
+            trigger_price = lot["target_price"]
+
+        if trigger_price is None:
+            continue
+
+        charges = compute_charges("SELL", int(lot["qty"]), float(trigger_price), lot["segment"], cs)
+        trade = {
+            "traded_at": now.isoformat(),
+            "symbol": lot["symbol"],
+            "exchange": lot["exchange"],
+            "segment": lot["segment"],
+            "side": "SELL",
+            "qty": int(lot["qty"]),
+            "price": float(trigger_price),
+            "position_id": lot["position_id"],
+            "notes": f"Auto SELL: {trigger_name} reached for BUY #{lot['buy_trade_id']} (LTP {_fmt_inr(float(ltp))})",
+            "stop_loss": None,
+            "target_price": None,
+            "gross": charges.gross,
+            "charges": charges.total,
+            "net_cash": net_cash_flow("SELL", charges),
+        }
+        tid = insert_trade(conn, trade)
+        executed.append(
+            f"Auto SELL #{tid}: {lot['qty']} {lot['symbol']} at {_fmt_inr(float(trigger_price))} ({trigger_name})"
+        )
+
+    return executed
+
+
 def _color_return_pct_cell(val: object) -> str:
     try:
         num = float(val)
@@ -1320,6 +1438,14 @@ def main() -> None:
         cs = _load_charge_settings(conn)
         trades = list_trades(conn)
         trades_df = trades_to_df(trades)
+        auto_exits = _auto_execute_exit_orders(conn, trades_df, cs)
+        if auto_exits:
+            trades = list_trades(conn)
+            trades_df = trades_to_df(trades)
+            st.session_state["toast"] = (
+                "success",
+                " · ".join(auto_exits),
+            )
 
         nav_options = ["Dashboard", "New trade", "Risk / reward", "History", "Settings"]
         if "nav_tab" in st.session_state:
