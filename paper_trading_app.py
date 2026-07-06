@@ -12,7 +12,7 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 import streamlit as st
 
-from charges import ChargeSettings, compute_charges, net_cash_flow
+from charges import ChargeSettings, TradeCharges, compute_charges, net_cash_flow
 from nifty_indices import (
     get_nifty100_symbols,
     get_nifty50_symbols,
@@ -164,13 +164,6 @@ def _load_charge_settings(conn) -> ChargeSettings:
     except json.JSONDecodeError:
         d = {}
     return ChargeSettings(
-        brokerage_per_order=float(d.get("brokerage_per_order", 20)),
-        gst_on_brokerage=float(d.get("gst_on_brokerage", 0.18)),
-        stt_delivery_sell=float(d.get("stt_delivery_sell", 0.001)),
-        stt_intraday_sell=float(d.get("stt_intraday_sell", 0.00025)),
-        exchange_txn_pct=float(d.get("exchange_txn_pct", 0.0000345)),
-        sebi_pct=float(d.get("sebi_pct", 0.000001)),
-        stamp_duty_buy=float(d.get("stamp_duty_buy", 0.00015)),
         dp_delivery_sell=float(d.get("dp_delivery_sell", 15.93)),
     )
 
@@ -181,17 +174,24 @@ def _save_charge_settings(conn, cs: ChargeSettings) -> None:
         "charge_settings",
         json.dumps(
             {
-                "brokerage_per_order": cs.brokerage_per_order,
-                "gst_on_brokerage": cs.gst_on_brokerage,
-                "stt_delivery_sell": cs.stt_delivery_sell,
-                "stt_intraday_sell": cs.stt_intraday_sell,
-                "exchange_txn_pct": cs.exchange_txn_pct,
-                "sebi_pct": cs.sebi_pct,
-                "stamp_duty_buy": cs.stamp_duty_buy,
                 "dp_delivery_sell": cs.dp_delivery_sell,
             }
         ),
     )
+
+
+def _format_zerodha_charge_preview(charges: TradeCharges) -> str:
+    parts = [
+        f"brokerage {_fmt_inr(charges.brokerage)}",
+        f"STT {_fmt_inr(charges.stt)}",
+        f"exchange & SEBI {_fmt_inr(charges.exchange_sebi)}",
+        f"GST {_fmt_inr(charges.gst)}",
+    ]
+    if charges.stamp:
+        parts.append(f"stamp {_fmt_inr(charges.stamp)}")
+    if charges.dp:
+        parts.append(f"DP {_fmt_inr(charges.dp)}")
+    return " · ".join(parts)
 
 
 @st.cache_data(ttl=3600)
@@ -357,7 +357,14 @@ def _auto_execute_exit_orders(conn, trades_df: pd.DataFrame, cs: ChargeSettings)
         if trigger_price is None:
             continue
 
-        charges = compute_charges("SELL", int(lot["qty"]), float(trigger_price), lot["segment"], cs)
+        charges = compute_charges(
+            "SELL",
+            int(lot["qty"]),
+            float(trigger_price),
+            lot["segment"],
+            cs,
+            exchange=lot["exchange"],
+        )
         trade = {
             "traded_at": now.isoformat(),
             "symbol": lot["symbol"],
@@ -1006,13 +1013,14 @@ def page_new_trade(conn, starting: float, trades_df: pd.DataFrame, cs: ChargeSet
         submitted = st.form_submit_button("Submit order", type="primary")
 
     if not submitted:
-        preview = compute_charges(side, int(qty), float(price), segment, cs)
+        preview = compute_charges(side, int(qty), float(price), segment, cs, exchange=exchange)
         net = net_cash_flow(side, preview)
         flow = "leaves your account" if net < 0 else "enters your account"
         st.info(
-            f"**Order preview** (not saved yet) · "
+            f"**Order preview** (Zerodha calculator rates) · "
             f"**Trade value:** {_fmt_inr(preview.gross)} · "
-            f"**Est. charges:** {_fmt_inr(preview.total)} · "
+            f"**Est. charges:** {_fmt_inr(preview.total)} "
+            f"({_format_zerodha_charge_preview(preview)}) · "
             f"**Cash impact:** {_fmt_inr(net)} ({flow})"
         )
         return
@@ -1030,7 +1038,7 @@ def page_new_trade(conn, starting: float, trades_df: pd.DataFrame, cs: ChargeSet
             st.error(f"Insufficient holdings: you have {held.qty if held else 0} shares of {sym}")
             return
 
-    charges = compute_charges(side, int(qty), float(price), segment, cs)
+    charges = compute_charges(side, int(qty), float(price), segment, cs, exchange=exchange)
     net = net_cash_flow(side, charges)
     cash = cash_balance(starting, trades_df)
     if side == "BUY" and cash + net < -0.01:
@@ -1370,10 +1378,17 @@ def page_settings(conn) -> None:
         st.success("Saved.")
         st.rerun()
 
-    st.markdown("#### Brokerage & charges (approximate)")
+    st.markdown("#### Brokerage & charges (Zerodha calculator)")
+    st.caption(
+        "Rates match [Zerodha's brokerage calculator](https://zerodha.com/brokerage-calculator/): "
+        "₹0 delivery brokerage, intraday min(₹20, 0.03%), plus STT, exchange, SEBI, GST, stamp duty, and DP on delivery sells."
+    )
     cs = _load_charge_settings(conn)
-    cs.brokerage_per_order = st.number_input("Brokerage per order (₹)", value=cs.brokerage_per_order)
-    cs.gst_on_brokerage = st.number_input("GST on brokerage (0.18 = 18%)", value=cs.gst_on_brokerage, format="%.4f")
+    cs.dp_delivery_sell = st.number_input(
+        "DP charges — delivery sell (₹)",
+        value=cs.dp_delivery_sell,
+        help="Depository charge per delivery sell (Zerodha default ₹15.93 + GST is included in their calculator total).",
+    )
     if st.button("Save charge settings"):
         _save_charge_settings(conn, cs)
         st.success("Charge settings saved.")
@@ -1474,7 +1489,7 @@ def main() -> None:
 
         st.title("Indian equities — paper trading")
         st.caption(
-            "All NSE-listed equities supported · virtual portfolio · approximate Indian charges · "
+            "All NSE-listed equities supported · virtual portfolio · Zerodha brokerage calculator rates · "
             "not investment advice."
         )
 

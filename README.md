@@ -1,6 +1,6 @@
 # Paper trading (Indian equities)
 
-Web app and Excel workbook for virtual NSE/BSE paper trading with approximate Indian brokerage charges.
+Web app and Excel workbook for virtual NSE/BSE paper trading with Zerodha brokerage calculator charges.
 
 **Symbols:** Full NSE list (~2,100+ symbols) plus **Nifty 50** and **Nifty 100** filters on the New trade tab.
 

@@ -1,4 +1,4 @@
-"""Approximate Indian equity charges for paper trading."""
+"""Indian equity charges for paper trading (Zerodha brokerage calculator rates)."""
 
 from __future__ import annotations
 
@@ -7,13 +7,8 @@ from dataclasses import dataclass
 
 @dataclass
 class ChargeSettings:
-    brokerage_per_order: float = 20.0
-    gst_on_brokerage: float = 0.18
-    stt_delivery_sell: float = 0.001
-    stt_intraday_sell: float = 0.00025
-    exchange_txn_pct: float = 0.0000345
-    sebi_pct: float = 0.000001
-    stamp_duty_buy: float = 0.00015
+    """Configurable overrides; Zerodha statutory rates are fixed in compute_charges."""
+
     dp_delivery_sell: float = 15.93
 
 
@@ -32,27 +27,57 @@ class TradeCharges:
         return self.brokerage + self.stt + self.exchange_sebi + self.stamp + self.gst + self.dp
 
 
+def _round2(value: float) -> float:
+    return round(float(value), 2)
+
+
+def _round0(value: float) -> float:
+    return round(float(value))
+
+
+def _zerodha_brokerage_leg(turnover: float) -> float:
+    """Intraday/F&O: lower of ₹20 or 0.03% per executed order (Zerodha tariff)."""
+    return min(20.0, _round2(turnover * 0.0003))
+
+
+def _exchange_turnover_charge(turnover: float, exchange: str) -> float:
+    """NSE equity txn charge + IPFT; BSE uses a higher txn rate (zerodha.com/static/js/brokerage.js)."""
+    ex = exchange.upper()
+    if ex == "BSE":
+        return _round2(turnover * 0.0000375)
+    return _round2(turnover * (0.0000297 + 0.000001))
+
+
 def compute_charges(
     side: str,
     qty: int,
     price: float,
     segment: str,
-    settings: ChargeSettings,
+    settings: ChargeSettings | None = None,
+    exchange: str = "NSE",
 ) -> TradeCharges:
-    gross = float(qty) * float(price)
-    brokerage = settings.brokerage_per_order
+    """Per-order charges using Zerodha's public brokerage calculator formulas."""
+    settings = settings or ChargeSettings()
     is_sell = side.upper() == "SELL"
     is_intraday = segment == "Equity Intraday"
+    gross = float(qty) * float(price)
+    turnover = gross
 
-    stt = 0.0
-    if is_sell:
-        rate = settings.stt_intraday_sell if is_intraday else settings.stt_delivery_sell
-        stt = gross * rate
+    if is_intraday:
+        brokerage = _zerodha_brokerage_leg(turnover)
+        stt = _round0(gross * 0.00025) if is_sell else 0.0
+        stamp = _round0(gross * 0.00003) if not is_sell else 0.0
+        dp = 0.0
+    else:
+        brokerage = 0.0
+        stt = _round0(turnover * 0.001)
+        stamp = _round0(gross * 0.00015) if not is_sell else 0.0
+        dp = settings.dp_delivery_sell if is_sell else 0.0
 
-    exchange_sebi = gross * (settings.exchange_txn_pct + settings.sebi_pct)
-    stamp = gross * settings.stamp_duty_buy if not is_sell else 0.0
-    gst = brokerage * settings.gst_on_brokerage
-    dp = settings.dp_delivery_sell if (is_sell and not is_intraday) else 0.0
+    exchange_charge = _exchange_turnover_charge(turnover, exchange)
+    sebi = _round2(turnover * 0.000001)
+    exchange_sebi = _round2(exchange_charge + sebi)
+    gst = _round2(0.18 * (brokerage + exchange_charge + sebi))
 
     return TradeCharges(
         gross=gross,

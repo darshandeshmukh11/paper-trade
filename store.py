@@ -22,13 +22,6 @@ from db import (
 IST = ZoneInfo("Asia/Kolkata")
 
 _DEFAULT_CHARGES = {
-    "brokerage_per_order": 20,
-    "gst_on_brokerage": 0.18,
-    "stt_delivery_sell": 0.001,
-    "stt_intraday_sell": 0.00025,
-    "exchange_txn_pct": 0.0000345,
-    "sebi_pct": 0.000001,
-    "stamp_duty_buy": 0.00015,
     "dp_delivery_sell": 15.93,
 }
 

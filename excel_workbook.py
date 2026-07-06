@@ -416,13 +416,6 @@ def _charge_settings_from_sheet(wb: Workbook) -> ChargeSettings:
         return ChargeSettings()
     ws = wb["Settings"]
     return ChargeSettings(
-        brokerage_per_order=float(ws["C5"].value or 20),
-        gst_on_brokerage=float(ws["C6"].value or 0.18),
-        stt_delivery_sell=float(ws["C7"].value or 0.001),
-        stt_intraday_sell=float(ws["C8"].value or 0.00025),
-        exchange_txn_pct=float(ws["C9"].value or 0.0000345),
-        sebi_pct=float(ws["C10"].value or 0.000001),
-        stamp_duty_buy=float(ws["C11"].value or 0.00015),
         dp_delivery_sell=float(ws["C13"].value or 15.93),
     )
 
@@ -454,6 +447,7 @@ def trades_df_from_workbook(wb: Workbook) -> tuple[pd.DataFrame, float]:
             traded_iso = str(traded)
 
         segment = str(ws.cell(row=r, column=COL_SEGMENT).value or "Equity Delivery")
+        exchange = str(ws.cell(row=r, column=COL_EXCHANGE).value or "NSE")
         price = float(ws.cell(row=r, column=COL_PRICE).value or 0)
         qty_i = int(qty)
         side_u = str(side).upper()
@@ -466,14 +460,17 @@ def trades_df_from_workbook(wb: Workbook) -> tuple[pd.DataFrame, float]:
             gross = float(gross_val)
             charges = float(charges_val)
         else:
-            ch = compute_charges(side_u, qty_i, price, segment, cs)
+            ch = compute_charges(side_u, qty_i, price, segment, cs, exchange=exchange)
             gross = ch.gross
             charges = ch.total
 
         if isinstance(net_val, (int, float)):
             net = float(net_val)
         else:
-            net = net_cash_flow(side_u, compute_charges(side_u, qty_i, price, segment, cs))
+            net = net_cash_flow(
+                side_u,
+                compute_charges(side_u, qty_i, price, segment, cs, exchange=exchange),
+            )
 
         rows.append(
             {
