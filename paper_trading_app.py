@@ -235,6 +235,20 @@ def _fmt_inr(x: float) -> str:
     return f"₹{x:,.2f}"
 
 
+def _fmt_trade_datetime(value: object) -> str:
+    """Format a trade timestamp for display (handles mixed ISO / date-only strings)."""
+    if value is None or value == "" or (isinstance(value, float) and pd.isna(value)):
+        return "—"
+    ts = pd.to_datetime(value, errors="coerce")
+    if pd.isna(ts):
+        return "—"
+    if hasattr(ts, "tz") and ts.tz is not None:
+        ts = ts.tz_convert(IST)
+    elif hasattr(ts, "tz_localize"):
+        ts = ts.tz_localize(IST)
+    return ts.strftime("%Y-%m-%d %H:%M")
+
+
 def _optional_order_price(value: float) -> float | None:
     """Treat 0 as unset for optional stop loss / target fields."""
     return float(value) if value and value > 0 else None
@@ -1073,8 +1087,8 @@ def _style_completed_cycles_table(df: pd.DataFrame):
         },
     ]
     display = df.copy()
-    display["buy_date"] = pd.to_datetime(display["buy_date"]).dt.strftime("%Y-%m-%d %H:%M")
-    display["sell_date"] = pd.to_datetime(display["sell_date"]).dt.strftime("%Y-%m-%d %H:%M")
+    display["buy_date"] = display["buy_date"].apply(_fmt_trade_datetime)
+    display["sell_date"] = display["sell_date"].apply(_fmt_trade_datetime)
     if "abs_return_pct" not in display.columns and "return_pct" in display.columns:
         display["abs_return_pct"] = display["return_pct"]
     if "hold_days" not in display.columns:
@@ -1312,7 +1326,7 @@ def page_history(conn) -> None:
 
     st.markdown("#### All trades")
     df = trades_to_df(trades)
-    df["traded_at"] = pd.to_datetime(df["traded_at"]).dt.strftime("%Y-%m-%d %H:%M")
+    df["traded_at"] = df["traded_at"].apply(_fmt_trade_datetime)
     if "stop_loss" not in df.columns:
         df["stop_loss"] = None
     if "target_price" not in df.columns:
