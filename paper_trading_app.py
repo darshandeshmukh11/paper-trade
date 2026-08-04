@@ -13,6 +13,7 @@ import pandas as pd
 import streamlit as st
 
 from charges import ChargeSettings, TradeCharges, compute_charges, net_cash_flow
+from page_expenses import page_expenses, trades_expenses, consolidated_expense_summary
 from nifty_indices import (
     get_nifty100_symbols,
     get_nifty50_symbols,
@@ -869,6 +870,39 @@ def _render_open_positions_section(
         st.info("No open positions. Place a BUY from the **New trade** tab.")
 
 
+def _render_charges_summary_section(trades_df: pd.DataFrame, total_pnl: float) -> None:
+    """Compact charges snapshot on the main dashboard: overall total + per-trade table."""
+    st.markdown("#### 💸 Charges — per trade & overall")
+
+    if trades_df.empty:
+        st.caption("No trades yet — charges will appear here once you place a trade.")
+        return
+
+    expenses_df = trades_expenses(trades_df)
+    summary = consolidated_expense_summary(expenses_df)
+
+    # total_pnl (cash + holdings − starting) is already net of all charges, since every
+    # trade's net_cash bakes charges in. Gross P&L is what you'd have made with zero charges.
+    gross_pnl_before_charges = total_pnl + summary["total"]
+
+    d1, d2, d3, d4 = st.columns(4)
+    d1.metric("Gross P&L (before charges)", _fmt_inr(gross_pnl_before_charges))
+    d2.metric("Total charges (all trades)", _fmt_inr(summary["total"]), f"{summary['avg_pct']:.4f}% of turnover")
+    _pnl_metric(d3, "Net P&L (after charges)", total_pnl)
+    d4.metric("Trades charged", str(len(expenses_df)))
+
+    with st.expander(f"Per-trade charges ({len(expenses_df)} trade{'s' if len(expenses_df) != 1 else ''})", expanded=False):
+        cols = [
+            "Trade ID", "Date", "Symbol", "Side", "Qty", "Price", "Gross ₹",
+            "Brokerage ₹", "STT ₹", "Exchange & SEBI ₹", "Stamp ₹", "GST ₹", "DP ₹",
+            "Total Charges ₹",
+        ]
+        st.dataframe(expenses_df[cols], use_container_width=True, hide_index=True)
+        st.caption(
+            "Full breakdown, buy/sell split, and profit waterfall are on the **Expenses** tab."
+        )
+
+
 def page_dashboard(conn, starting: float, trades_df: pd.DataFrame) -> None:
     positions = compute_positions(trades_df)
     pos_rows, mtm, holdings_value, live_quote_count = _build_open_position_rows(positions, trades_df)
@@ -897,13 +931,22 @@ def page_dashboard(conn, starting: float, trades_df: pd.DataFrame) -> None:
     _pnl_metric(c6, "Realized P&L (closed)", realized)
     c7.metric("Open positions", str(len(positions)))
 
+    _render_charges_summary_section(trades_df, total_pnl)
+
     perf = _build_performance_context(starting, trades_df, use_live_ltp=True)
     closed_df = perf.get("closed_df")
     if closed_df is None:
         closed_df = pd.DataFrame()
     _render_turnover_and_tax(trades_df, closed_df, total_pnl)
 
-    _render_returns_section(perf, trades_df=trades_df, starting=starting, show_cycles_table=True, cycles_expanded=False)
+    _render_returns_section(
+        perf,
+        trades_df=trades_df,
+        starting=starting,
+        show_cycles_table=True,
+        cycles_expanded=True,
+        use_styled_cycles=True,
+    )
 
 
 def page_new_trade(conn, starting: float, trades_df: pd.DataFrame, cs: ChargeSettings) -> None:
@@ -1476,7 +1519,7 @@ def main() -> None:
                 " · ".join(auto_exits),
             )
 
-        nav_options = ["Dashboard", "New trade", "Risk / reward", "History", "Settings"]
+        nav_options = ["Dashboard", "New trade", "Risk / reward", "Expenses", "History", "Settings"]
         if "nav_tab" in st.session_state:
             st.session_state["nav_tab_radio"] = st.session_state.pop("nav_tab")
         tab = st.sidebar.radio(
@@ -1509,6 +1552,11 @@ def main() -> None:
             page_new_trade(conn, starting, trades_df, cs)
         elif tab == "Risk / reward":
             page_risk_reward()
+        elif tab == "Expenses":
+            positions = compute_positions(trades_df)
+            _, _, holdings_value, _ = _build_open_position_rows(positions, trades_df)
+            terminal_equity = cash_balance(starting, trades_df) + holdings_value
+            page_expenses(trades_df, starting, terminal_equity)
         elif tab == "History":
             page_history(conn)
         else:
