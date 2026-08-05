@@ -17,6 +17,7 @@ class Position:
     qty: int
     avg_cost: float
     cost_basis: float
+    notes: Optional[str] = None
 
 
 def trades_to_df(trades: list[Any]) -> pd.DataFrame:
@@ -29,12 +30,13 @@ def compute_positions(trades_df: pd.DataFrame) -> list[Position]:
     if trades_df.empty:
         return []
     positions: dict[str, dict[str, Any]] = {}
-    chron = trades_df.sort_values(["traded_at", "id"])
+    chron = trades_df.sort_values(["traded_at", "id"]) 
     for _, row in chron.iterrows():
         sym = str(row["symbol"]).upper()
         side = str(row["side"]).upper()
         qty = int(row["qty"])
         price = float(row["price"])
+        notes = row.get("notes") or ""
         if sym not in positions:
             positions[sym] = {
                 "symbol": sym,
@@ -42,23 +44,43 @@ def compute_positions(trades_df: pd.DataFrame) -> list[Position]:
                 "segment": row.get("segment", "Equity Delivery"),
                 "qty": 0,
                 "cost_basis": 0.0,
+                # internal lot tracking for FIFO matching (qty, price, notes)
+                "lots": [],
             }
         p = positions[sym]
         if side == "BUY":
             p["cost_basis"] += qty * price
             p["qty"] += qty
+            # record lot with notes so we can expose notes for remaining lots
+            p["lots"].append({"qty": qty, "price": price, "notes": notes})
         elif side == "SELL":
             if qty > p["qty"]:
                 raise ValueError(f"Cannot sell {qty} of {sym}: only {p['qty']} held")
             if p["qty"] > 0:
-                avg = p["cost_basis"] / p["qty"]
+                avg = p["cost_basis"] / p["qty"] if p["qty"] else 0.0
                 p["cost_basis"] -= avg * qty
             p["qty"] -= qty
+            # reduce FIFO lots
+            remaining = qty
+            while remaining > 0 and p["lots"]:
+                lot = p["lots"][0]
+                match = min(remaining, int(lot["qty"]))
+                lot["qty"] -= match
+                remaining -= match
+                if lot["qty"] <= 0:
+                    p["lots"].pop(0)
     out: list[Position] = []
     for p in positions.values():
         if p["qty"] <= 0:
             continue
         avg_cost = p["cost_basis"] / p["qty"] if p["qty"] else 0.0
+        # collect distinct non-empty notes from remaining lots
+        notes_list = []
+        for lot in p.get("lots", []):
+            n = (lot.get("notes") or "").strip()
+            if n and n not in notes_list:
+                notes_list.append(n)
+        notes = " | ".join(notes_list) if notes_list else None
         out.append(
             Position(
                 symbol=p["symbol"],
@@ -67,6 +89,7 @@ def compute_positions(trades_df: pd.DataFrame) -> list[Position]:
                 qty=int(p["qty"]),
                 avg_cost=avg_cost,
                 cost_basis=p["cost_basis"],
+                notes=notes,
             )
         )
     return sorted(out, key=lambda x: x.symbol)
