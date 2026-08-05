@@ -320,3 +320,15 @@ def storage_label() -> str:
     if use_supabase():
         return "Supabase"
     return _sqlite_path().name
+
+# New helper: update_trade
+
+def update_trade(conn: Connection, trade_id: int, updates: dict[str, Any]) -> None:
+    """Update fields of a trade row (used to edit notes)."""
+    if not updates:
+        return
+    keys = list(updates.keys())
+    set_clause = ", ".join(f"{k} = ?" for k in keys)
+    params = [updates[k] for k in keys] + [int(trade_id)]
+    conn.execute(f"UPDATE trades SET {set_clause} WHERE id = ?", params)
+    conn.commit()
