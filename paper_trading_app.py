@@ -47,6 +47,7 @@ from store import (
     list_trades,
     set_setting,
     storage_label,
+    update_trade,
 )
 
 IST = ZoneInfo("Asia/Kolkata")
@@ -282,8 +283,15 @@ def _lot_key(row: pd.Series) -> tuple[str, str]:
     return (str(row["symbol"]).upper(), "")
 
 
-def _open_exit_order_lots(trades_df: pd.DataFrame) -> list[dict]:
-    """Return remaining BUY lots that still carry a stop loss or target price."""
+def _remaining_buy_lots(
+    trades_df: pd.DataFrame,
+    symbol: str | None = None,
+) -> list[dict]:
+    """Return FIFO-remaining BUY lots (qty > 0) with trade id and notes.
+
+    Optionally filter to one symbol. Used for open-position notes editing and
+    as the base for exit-order lot tracking.
+    """
     if trades_df.empty:
         return []
 
@@ -296,10 +304,6 @@ def _open_exit_order_lots(trades_df: pd.DataFrame) -> list[dict]:
         qty = int(row["qty"])
 
         if side == "BUY":
-            stop_loss = _positive_optional_float(row.get("stop_loss"))
-            target_price = _positive_optional_float(row.get("target_price"))
-            if stop_loss is None and target_price is None:
-                continue
             lots_by_key.setdefault(key, []).append(
                 {
                     "qty": qty,
@@ -307,9 +311,10 @@ def _open_exit_order_lots(trades_df: pd.DataFrame) -> list[dict]:
                     "exchange": row.get("exchange", "NSE") or "NSE",
                     "segment": row.get("segment", "Equity Delivery") or "Equity Delivery",
                     "position_id": str(row.get("position_id") or "").strip() or None,
-                    "stop_loss": stop_loss,
-                    "target_price": target_price,
+                    "stop_loss": _positive_optional_float(row.get("stop_loss")),
+                    "target_price": _positive_optional_float(row.get("target_price")),
                     "buy_trade_id": int(row["id"]),
+                    "notes": str(row.get("notes") or ""),
                 }
             )
             continue
@@ -333,7 +338,30 @@ def _open_exit_order_lots(trades_df: pd.DataFrame) -> list[dict]:
             if remaining_sell_qty <= 0:
                 break
 
-    return [lot for lots in lots_by_key.values() for lot in lots if lot["qty"] > 0]
+    lots = [lot for group in lots_by_key.values() for lot in group if lot["qty"] > 0]
+    if symbol:
+        sym = symbol.upper().strip()
+        lots = [lot for lot in lots if lot["symbol"] == sym]
+    return lots
+
+
+def _aggregate_lot_notes(lots: list[dict]) -> str:
+    """Distinct non-empty notes from lots, joined like Position.notes."""
+    notes_list: list[str] = []
+    for lot in lots:
+        n = (lot.get("notes") or "").strip()
+        if n and n not in notes_list:
+            notes_list.append(n)
+    return " | ".join(notes_list)
+
+
+def _open_exit_order_lots(trades_df: pd.DataFrame) -> list[dict]:
+    """Return remaining BUY lots that still carry a stop loss or target price."""
+    return [
+        lot
+        for lot in _remaining_buy_lots(trades_df)
+        if lot.get("stop_loss") is not None or lot.get("target_price") is not None
+    ]
 
 
 def _auto_execute_exit_orders(conn, trades_df: pd.DataFrame, cs: ChargeSettings) -> list[str]:
@@ -844,12 +872,15 @@ def _build_open_position_rows(positions: list, trades_df: pd.DataFrame | None = 
                 "Market value": round(mv, 2),
                 "Unrealized P&L": round(upl, 2),
                 "Days held": float(days_held),
+                "Notes": (p.notes or "").strip() or "—",
             }
         )
     return pos_rows, mtm, holdings_value, live_quote_count
 
 
 def _render_open_positions_section(
+    conn,
+    trades_df: pd.DataFrame,
     pos_rows: list[dict],
     positions: list,
     live_quote_count: int,
@@ -866,6 +897,39 @@ def _render_open_positions_section(
                 f"Live LTP for {live_quote_count}/{len(positions)} positions — "
                 "others use avg cost until Yahoo returns a price. Use **Refresh LTP** in the sidebar."
             )
+
+        st.markdown("#### Edit position notes")
+        symbols = [p.symbol for p in positions]
+        note_sym = st.selectbox(
+            "Open position",
+            options=symbols,
+            key="open_pos_notes_symbol",
+        )
+        lots = _remaining_buy_lots(trades_df, note_sym)
+        if not lots:
+            st.caption(f"No remaining BUY lots for {note_sym}.")
+        else:
+            trade_ids = [int(lot["buy_trade_id"]) for lot in lots]
+            prefill = _aggregate_lot_notes(lots)
+            st.caption(
+                f"Saving updates notes on remaining BUY trade(s): "
+                + ", ".join(f"#{tid}" for tid in trade_ids)
+            )
+            pos_notes = st.text_area(
+                "Notes",
+                value=prefill,
+                height=100,
+                key=f"open_pos_notes_text_{note_sym}",
+                placeholder="Thesis, levels, reminders…",
+            )
+            if st.button("Save position notes", key="save_open_pos_notes"):
+                text = (pos_notes or "").strip()
+                for tid in trade_ids:
+                    update_trade(conn, tid, {"notes": text})
+                st.success(
+                    f"Updated notes on {len(trade_ids)} BUY trade(s) for {note_sym}."
+                )
+                st.rerun()
     else:
         st.info("No open positions. Place a BUY from the **New trade** tab.")
 
@@ -906,7 +970,7 @@ def _render_charges_summary_section(trades_df: pd.DataFrame, total_pnl: float) -
 def page_dashboard(conn, starting: float, trades_df: pd.DataFrame) -> None:
     positions = compute_positions(trades_df)
     pos_rows, mtm, holdings_value, live_quote_count = _build_open_position_rows(positions, trades_df)
-    _render_open_positions_section(pos_rows, positions, live_quote_count)
+    _render_open_positions_section(conn, trades_df, pos_rows, positions, live_quote_count)
 
     st.caption(
         "Open-position P&L uses **live LTP** (Yahoo). Cached ~90s · **Refresh LTP / prices** in sidebar. "
@@ -1403,6 +1467,38 @@ def page_history(conn) -> None:
         ]
     ].copy()
     st.dataframe(show, use_container_width=True, hide_index=True)
+
+    st.markdown("#### Edit trade notes")
+    trade_ids = [int(r["id"]) for r in trades]
+    id_labels = {
+        int(r["id"]): (
+            f"#{int(r['id'])} · {r['symbol']} · {r['side']} · "
+            f"{_fmt_trade_datetime(r['traded_at'])}"
+        )
+        for r in trades
+    }
+    selected_id = st.selectbox(
+        "Trade ID",
+        options=trade_ids,
+        format_func=lambda tid: id_labels.get(tid, str(tid)),
+        key="history_notes_trade_id",
+    )
+    current_notes = ""
+    for r in trades:
+        if int(r["id"]) == int(selected_id):
+            current_notes = str(r["notes"] or "")
+            break
+    edited_notes = st.text_area(
+        "Notes",
+        value=current_notes,
+        height=120,
+        key=f"history_notes_text_{selected_id}",
+        placeholder="Add context for this fill…",
+    )
+    if st.button("Save notes", key="history_save_notes"):
+        update_trade(conn, int(selected_id), {"notes": (edited_notes or "").strip()})
+        st.success(f"Saved notes for trade #{int(selected_id)}.")
+        st.rerun()
 
     st.markdown("#### Delete a trade")
     del_id = st.number_input("Trade ID to delete", min_value=1, step=1)
