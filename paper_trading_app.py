@@ -266,6 +266,16 @@ def _display_optional_price(value: object) -> str:
     return _fmt_inr(num) if num > 0 else "—"
 
 
+def _display_optional_pct(value: object) -> str:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return "—"
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        return "—"
+    return f"{num:+.2f}%"
+
+
 def _positive_optional_float(value: object) -> float | None:
     if value is None or (isinstance(value, float) and pd.isna(value)):
         return None
@@ -274,6 +284,41 @@ def _positive_optional_float(value: object) -> float | None:
     except (TypeError, ValueError):
         return None
     return num if num > 0 else None
+
+
+def _aggregate_open_exit_levels(lots: list[dict]) -> tuple[float | None, float | None]:
+    """Qty-weighted stop loss / target from remaining open BUY lots."""
+    sl_num = sl_den = 0.0
+    tg_num = tg_den = 0.0
+    for lot in lots:
+        q = int(lot.get("qty") or 0)
+        if q <= 0:
+            continue
+        sl = lot.get("stop_loss")
+        tg = lot.get("target_price")
+        if sl is not None:
+            sl_num += float(sl) * q
+            sl_den += q
+        if tg is not None:
+            tg_num += float(tg) * q
+            tg_den += q
+    stop = (sl_num / sl_den) if sl_den else None
+    target = (tg_num / tg_den) if tg_den else None
+    return stop, target
+
+
+def _pct_distance_from_ltp(ltp: float, level: float | None, *, above_is_positive: bool) -> float | None:
+    """% distance between LTP and a level.
+
+    * Stop (``above_is_positive=True``): ``(ltp - level) / ltp`` → + means LTP still above stop.
+    * Target (``above_is_positive=False``): ``(level - ltp) / ltp`` → + means still below target.
+    """
+    if level is None or ltp <= 0:
+        return None
+    level_f = float(level)
+    if above_is_positive:
+        return (ltp - level_f) / ltp * 100.0
+    return (level_f - ltp) / ltp * 100.0
 
 
 def _lot_key(row: pd.Series) -> tuple[str, str]:
@@ -463,14 +508,19 @@ def _style_open_positions_table(df: pd.DataFrame):
         },
     ]
     styler = df.style.set_table_styles(dark_table)
-    if hasattr(styler, "map"):
-        styler = styler.map(_color_pnl_cell, subset=["Unrealized P&L"])
-    else:
-        styler = styler.applymap(_color_pnl_cell, subset=["Unrealized P&L"])
+    if "Unrealized P&L" in df.columns:
+        if hasattr(styler, "map"):
+            styler = styler.map(_color_pnl_cell, subset=["Unrealized P&L"])
+        else:
+            styler = styler.applymap(_color_pnl_cell, subset=["Unrealized P&L"])
     return styler.format(
         {
             "Avg cost": "₹{:,.2f}",
             "LTP": "₹{:,.2f}",
+            "Stop loss": _display_optional_price,
+            "Target": _display_optional_price,
+            "vs Stop %": _display_optional_pct,
+            "vs Target %": _display_optional_pct,
             "Market value": "₹{:,.2f}",
             "Unrealized P&L": "₹{:+,.2f}",
             "Days held": lambda x: _human_days(float(x)) if x is not None else "—",
@@ -848,6 +898,10 @@ def _build_open_position_rows(positions: list, trades_df: pd.DataFrame | None = 
     live_quote_count = 0
     pos_rows: list[dict] = []
     quotes = _fetch_quotes_parallel(positions)
+    lots_by_symbol: dict[str, list[dict]] = {}
+    if trades_df is not None and not trades_df.empty:
+        for lot in _remaining_buy_lots(trades_df):
+            lots_by_symbol.setdefault(lot["symbol"], []).append(lot)
     for p in positions:
         quote = quotes.get(p.symbol)
         if quote is not None:
@@ -862,12 +916,19 @@ def _build_open_position_rows(positions: list, trades_df: pd.DataFrame | None = 
         mtm += upl
         holdings_value += mv
         days_held = _open_position_hold_days(p.symbol, p.qty, trades_df) if trades_df is not None else 0.0
+        stop_loss, target = _aggregate_open_exit_levels(lots_by_symbol.get(p.symbol, []))
+        vs_stop = _pct_distance_from_ltp(float(ltp), stop_loss, above_is_positive=True)
+        vs_target = _pct_distance_from_ltp(float(ltp), target, above_is_positive=False)
         pos_rows.append(
             {
                 "Symbol": p.symbol,
                 "Qty": p.qty,
                 "Avg cost": round(p.avg_cost, 2),
                 "LTP": round(ltp, 2),
+                "Stop loss": round(stop_loss, 2) if stop_loss is not None else None,
+                "vs Stop %": round(vs_stop, 2) if vs_stop is not None else None,
+                "Target": round(target, 2) if target is not None else None,
+                "vs Target %": round(vs_target, 2) if vs_target is not None else None,
                 "Quote": quote_note,
                 "Market value": round(mv, 2),
                 "Unrealized P&L": round(upl, 2),
@@ -891,6 +952,11 @@ def _render_open_positions_section(
             _style_open_positions_table(pd.DataFrame(pos_rows)),
             use_container_width=True,
             hide_index=True,
+        )
+        st.caption(
+            "**vs Stop %** = how far LTP is above stop (+ = cushion). "
+            "**vs Target %** = how far LTP is below target (+ = still to go). "
+            "Levels are qty-weighted from remaining BUY lots with stop/target set."
         )
         if live_quote_count < len(positions):
             st.warning(
