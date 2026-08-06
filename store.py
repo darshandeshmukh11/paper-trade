@@ -324,7 +324,7 @@ def storage_label() -> str:
 # New helper: update_trade
 
 def update_trade(conn: Connection, trade_id: int, updates: dict[str, Any]) -> None:
-    """Update fields of a trade row (used to edit notes)."""
+    """Update fields of a trade row (notes, stop_loss, target_price, etc.)."""
     if not updates:
         return
     keys = list(updates.keys())

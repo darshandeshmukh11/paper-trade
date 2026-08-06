@@ -410,31 +410,39 @@ def _open_exit_order_lots(trades_df: pd.DataFrame) -> list[dict]:
 
 
 def _auto_execute_exit_orders(conn, trades_df: pd.DataFrame, cs: ChargeSettings) -> list[str]:
-    """Create SELL trades when live LTP reaches a BUY lot's stop loss or target."""
+    """Create SELL trades when live LTP reaches a BUY lot's stop loss or target.
+
+    Uses an uncached live quote so a stale LTP cache cannot delay exits.
+    Fill price is the live LTP once the level is breached (market-style exit).
+    """
+    from live_price import fetch_live_price
+
     executed: list[str] = []
     now = datetime.now(IST)
 
     for lot in _open_exit_order_lots(trades_df):
-        ltp = fetch_ltp(lot["symbol"], lot["exchange"])
+        # Bypass Streamlit LTP cache — exits must see the latest price.
+        ltp = fetch_live_price(lot["symbol"], lot["exchange"])
         if ltp is None:
             continue
 
         trigger_name = None
-        trigger_price = None
+        trigger_level = None
         if lot["stop_loss"] is not None and float(ltp) <= lot["stop_loss"]:
             trigger_name = "stop loss"
-            trigger_price = lot["stop_loss"]
+            trigger_level = lot["stop_loss"]
         elif lot["target_price"] is not None and float(ltp) >= lot["target_price"]:
             trigger_name = "target"
-            trigger_price = lot["target_price"]
+            trigger_level = lot["target_price"]
 
-        if trigger_price is None:
+        if trigger_level is None:
             continue
 
+        fill_price = float(ltp)
         charges = compute_charges(
             "SELL",
             int(lot["qty"]),
-            float(trigger_price),
+            fill_price,
             lot["segment"],
             cs,
             exchange=lot["exchange"],
@@ -446,9 +454,12 @@ def _auto_execute_exit_orders(conn, trades_df: pd.DataFrame, cs: ChargeSettings)
             "segment": lot["segment"],
             "side": "SELL",
             "qty": int(lot["qty"]),
-            "price": float(trigger_price),
+            "price": fill_price,
             "position_id": lot["position_id"],
-            "notes": f"Auto SELL: {trigger_name} reached for BUY #{lot['buy_trade_id']} (LTP {_fmt_inr(float(ltp))})",
+            "notes": (
+                f"Auto SELL: {trigger_name} {_fmt_inr(float(trigger_level))} "
+                f"hit for BUY #{lot['buy_trade_id']} (filled @ LTP {_fmt_inr(fill_price)})"
+            ),
             "stop_loss": None,
             "target_price": None,
             "gross": charges.gross,
@@ -457,7 +468,7 @@ def _auto_execute_exit_orders(conn, trades_df: pd.DataFrame, cs: ChargeSettings)
         }
         tid = insert_trade(conn, trade)
         executed.append(
-            f"Auto SELL #{tid}: {lot['qty']} {lot['symbol']} at {_fmt_inr(float(trigger_price))} ({trigger_name})"
+            f"Auto SELL #{tid}: {lot['qty']} {lot['symbol']} at {_fmt_inr(fill_price)} ({trigger_name})"
         )
 
     return executed
@@ -956,7 +967,8 @@ def _render_open_positions_section(
         st.caption(
             "**vs Stop %** = how far LTP is above stop (+ = cushion). "
             "**vs Target %** = how far LTP is below target (+ = still to go). "
-            "Levels are qty-weighted from remaining BUY lots with stop/target set."
+            "Levels are qty-weighted from remaining BUY lots with stop/target set. "
+            "When LTP hits stop or target, the position is auto-sold (check on each app load / **Refresh LTP**)."
         )
         if live_quote_count < len(positions):
             st.warning(
@@ -964,7 +976,7 @@ def _render_open_positions_section(
                 "others use avg cost until Yahoo returns a price. Use **Refresh LTP** in the sidebar."
             )
 
-        st.markdown("#### Edit position notes")
+        st.markdown("#### Edit exit levels & notes")
         symbols = [p.symbol for p in positions]
         note_sym = st.selectbox(
             "Open position",
@@ -976,11 +988,32 @@ def _render_open_positions_section(
             st.caption(f"No remaining BUY lots for {note_sym}.")
         else:
             trade_ids = [int(lot["buy_trade_id"]) for lot in lots]
+            agg_stop, agg_target = _aggregate_open_exit_levels(lots)
             prefill = _aggregate_lot_notes(lots)
             st.caption(
-                f"Saving updates notes on remaining BUY trade(s): "
+                f"Saving updates stop, target, and notes on remaining BUY trade(s): "
                 + ", ".join(f"#{tid}" for tid in trade_ids)
+                + ". Leave stop/target at 0 to clear."
             )
+            el1, el2 = st.columns(2)
+            with el1:
+                edit_stop = st.number_input(
+                    "Stop loss (₹)",
+                    min_value=0.0,
+                    value=float(agg_stop) if agg_stop is not None else 0.0,
+                    step=0.05,
+                    key=f"open_pos_stop_{note_sym}",
+                    help="Optional. Set 0 to clear. Auto-sells when LTP ≤ stop.",
+                )
+            with el2:
+                edit_target = st.number_input(
+                    "Target price (₹)",
+                    min_value=0.0,
+                    value=float(agg_target) if agg_target is not None else 0.0,
+                    step=0.05,
+                    key=f"open_pos_target_{note_sym}",
+                    help="Optional. Set 0 to clear. Auto-sells when LTP ≥ target.",
+                )
             pos_notes = st.text_area(
                 "Notes",
                 value=prefill,
@@ -988,12 +1021,17 @@ def _render_open_positions_section(
                 key=f"open_pos_notes_text_{note_sym}",
                 placeholder="Thesis, levels, reminders…",
             )
-            if st.button("Save position notes", key="save_open_pos_notes"):
+            if st.button("Save exit levels & notes", key="save_open_pos_notes"):
                 text = (pos_notes or "").strip()
+                updates = {
+                    "notes": text,
+                    "stop_loss": _optional_order_price(float(edit_stop)),
+                    "target_price": _optional_order_price(float(edit_target)),
+                }
                 for tid in trade_ids:
-                    update_trade(conn, tid, {"notes": text})
+                    update_trade(conn, tid, updates)
                 st.success(
-                    f"Updated notes on {len(trade_ids)} BUY trade(s) for {note_sym}."
+                    f"Updated stop/target/notes on {len(trade_ids)} BUY trade(s) for {note_sym}."
                 )
                 st.rerun()
     else:
@@ -1171,7 +1209,7 @@ def page_new_trade(conn, starting: float, trades_df: pd.DataFrame, cs: ChargeSet
                 min_value=0.0,
                 value=0.0,
                 step=0.05,
-                help="Optional. Leave 0 if not set.",
+                help="Optional. Leave 0 if not set. Auto-sells when LTP ≤ stop. Editable later on Dashboard.",
             )
         with c7:
             target_price = st.number_input(
@@ -1179,7 +1217,7 @@ def page_new_trade(conn, starting: float, trades_df: pd.DataFrame, cs: ChargeSet
                 min_value=0.0,
                 value=0.0,
                 step=0.05,
-                help="Optional. Leave 0 if not set.",
+                help="Optional. Leave 0 if not set. Auto-sells when LTP ≥ target. Editable later on Dashboard.",
             )
 
         notes = st.text_input("Notes", placeholder="Swing entry, support rejection, etc.")
@@ -1534,7 +1572,7 @@ def page_history(conn) -> None:
     ].copy()
     st.dataframe(show, use_container_width=True, hide_index=True)
 
-    st.markdown("#### Edit trade notes")
+    st.markdown("#### Edit trade")
     trade_ids = [int(r["id"]) for r in trades]
     id_labels = {
         int(r["id"]): (
@@ -1549,11 +1587,38 @@ def page_history(conn) -> None:
         format_func=lambda tid: id_labels.get(tid, str(tid)),
         key="history_notes_trade_id",
     )
-    current_notes = ""
-    for r in trades:
-        if int(r["id"]) == int(selected_id):
-            current_notes = str(r["notes"] or "")
-            break
+    selected_row = next((r for r in trades if int(r["id"]) == int(selected_id)), None)
+    current_notes = str((selected_row or {}).get("notes") or "")
+    selected_side = str((selected_row or {}).get("side") or "").upper()
+    current_stop = _positive_optional_float((selected_row or {}).get("stop_loss"))
+    current_target = _positive_optional_float((selected_row or {}).get("target_price"))
+
+    if selected_side == "BUY":
+        st.caption("Stop / target apply to this BUY lot. Auto-sell fires when LTP hits either level.")
+        h1, h2 = st.columns(2)
+        with h1:
+            hist_stop = st.number_input(
+                "Stop loss (₹)",
+                min_value=0.0,
+                value=float(current_stop) if current_stop is not None else 0.0,
+                step=0.05,
+                key=f"history_stop_{selected_id}",
+                help="Optional. Set 0 to clear.",
+            )
+        with h2:
+            hist_target = st.number_input(
+                "Target price (₹)",
+                min_value=0.0,
+                value=float(current_target) if current_target is not None else 0.0,
+                step=0.05,
+                key=f"history_target_{selected_id}",
+                help="Optional. Set 0 to clear.",
+            )
+    else:
+        hist_stop = None
+        hist_target = None
+        st.caption("Stop / target are set on BUY lots only.")
+
     edited_notes = st.text_area(
         "Notes",
         value=current_notes,
@@ -1561,9 +1626,13 @@ def page_history(conn) -> None:
         key=f"history_notes_text_{selected_id}",
         placeholder="Add context for this fill…",
     )
-    if st.button("Save notes", key="history_save_notes"):
-        update_trade(conn, int(selected_id), {"notes": (edited_notes or "").strip()})
-        st.success(f"Saved notes for trade #{int(selected_id)}.")
+    if st.button("Save trade", key="history_save_notes"):
+        updates: dict = {"notes": (edited_notes or "").strip()}
+        if selected_side == "BUY":
+            updates["stop_loss"] = _optional_order_price(float(hist_stop or 0))
+            updates["target_price"] = _optional_order_price(float(hist_target or 0))
+        update_trade(conn, int(selected_id), updates)
+        st.success(f"Saved trade #{int(selected_id)}.")
         st.rerun()
 
     st.markdown("#### Delete a trade")
