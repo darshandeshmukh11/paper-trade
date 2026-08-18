@@ -413,7 +413,14 @@ def _auto_execute_exit_orders(conn, trades_df: pd.DataFrame, cs: ChargeSettings)
     """Create SELL trades when live LTP reaches a BUY lot's stop loss or target.
 
     Uses an uncached live quote so a stale LTP cache cannot delay exits.
-    Fill price is the live LTP once the level is breached (market-style exit).
+
+    Fill price is the triggered stop-loss / target level itself, NOT the raw
+    live LTP. Exits are only checked when the app loads/reruns (not on every
+    tick), so by the time a check runs, price may already have moved well
+    past the level (gap-through). Filling at the live LTP in that case means
+    the recorded exit can be materially worse than the stop/target the user
+    actually set (e.g. stop set at ₹1,960 but filled at ₹1,939). Filling at
+    the level itself matches what the user intended the order to do.
     """
     from live_price import fetch_live_price
 
@@ -438,7 +445,8 @@ def _auto_execute_exit_orders(conn, trades_df: pd.DataFrame, cs: ChargeSettings)
         if trigger_level is None:
             continue
 
-        fill_price = float(ltp)
+        # Fill at the triggered level, not the live LTP (see docstring above).
+        fill_price = float(trigger_level)
         charges = compute_charges(
             "SELL",
             int(lot["qty"]),
@@ -458,7 +466,8 @@ def _auto_execute_exit_orders(conn, trades_df: pd.DataFrame, cs: ChargeSettings)
             "position_id": lot["position_id"],
             "notes": (
                 f"Auto SELL: {trigger_name} {_fmt_inr(float(trigger_level))} "
-                f"hit for BUY #{lot['buy_trade_id']} (filled @ LTP {_fmt_inr(fill_price)})"
+                f"hit for BUY #{lot['buy_trade_id']} (filled @ level {_fmt_inr(fill_price)}, "
+                f"LTP at check was {_fmt_inr(float(ltp))})"
             ),
             "stop_loss": None,
             "target_price": None,
@@ -968,7 +977,8 @@ def _render_open_positions_section(
             "**vs Stop %** = how far LTP is above stop (+ = cushion). "
             "**vs Target %** = how far LTP is below target (+ = still to go). "
             "Levels are qty-weighted from remaining BUY lots with stop/target set. "
-            "When LTP hits stop or target, the position is auto-sold (check on each app load / **Refresh LTP**)."
+            "When LTP hits stop or target, the position is auto-sold **at that level** "
+            "(check on each app load / **Refresh LTP**)."
         )
         if live_quote_count < len(positions):
             st.warning(
@@ -1003,7 +1013,7 @@ def _render_open_positions_section(
                     value=float(agg_stop) if agg_stop is not None else 0.0,
                     step=0.05,
                     key=f"open_pos_stop_{note_sym}",
-                    help="Optional. Set 0 to clear. Auto-sells when LTP ≤ stop.",
+                    help="Optional. Set 0 to clear. Auto-sells at this price when LTP ≤ stop.",
                 )
             with el2:
                 edit_target = st.number_input(
@@ -1012,7 +1022,7 @@ def _render_open_positions_section(
                     value=float(agg_target) if agg_target is not None else 0.0,
                     step=0.05,
                     key=f"open_pos_target_{note_sym}",
-                    help="Optional. Set 0 to clear. Auto-sells when LTP ≥ target.",
+                    help="Optional. Set 0 to clear. Auto-sells at this price when LTP ≥ target.",
                 )
             pos_notes = st.text_area(
                 "Notes",
@@ -1209,7 +1219,7 @@ def page_new_trade(conn, starting: float, trades_df: pd.DataFrame, cs: ChargeSet
                 min_value=0.0,
                 value=0.0,
                 step=0.05,
-                help="Optional. Leave 0 if not set. Auto-sells when LTP ≤ stop. Editable later on Dashboard.",
+                help="Optional. Leave 0 if not set. Auto-sells at this price when LTP ≤ stop. Editable later on Dashboard.",
             )
         with c7:
             target_price = st.number_input(
@@ -1217,7 +1227,7 @@ def page_new_trade(conn, starting: float, trades_df: pd.DataFrame, cs: ChargeSet
                 min_value=0.0,
                 value=0.0,
                 step=0.05,
-                help="Optional. Leave 0 if not set. Auto-sells when LTP ≥ target. Editable later on Dashboard.",
+                help="Optional. Leave 0 if not set. Auto-sells at this price when LTP ≥ target. Editable later on Dashboard.",
             )
 
         notes = st.text_input("Notes", placeholder="Swing entry, support rejection, etc.")
@@ -1594,7 +1604,7 @@ def page_history(conn) -> None:
     current_target = _positive_optional_float((selected_row or {}).get("target_price"))
 
     if selected_side == "BUY":
-        st.caption("Stop / target apply to this BUY lot. Auto-sell fires when LTP hits either level.")
+        st.caption("Stop / target apply to this BUY lot. Auto-sell fires at that level when LTP hits either one.")
         h1, h2 = st.columns(2)
         with h1:
             hist_stop = st.number_input(
