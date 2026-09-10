@@ -1111,6 +1111,8 @@ def page_dashboard(conn, starting: float, trades_df: pd.DataFrame) -> None:
 
     _render_charges_summary_section(trades_df, total_pnl)
 
+    page_risk_reward()
+
     perf = _build_performance_context(starting, trades_df, use_live_ltp=True)
     closed_df = perf.get("closed_df")
     if closed_df is None:
@@ -1760,7 +1762,7 @@ def main() -> None:
                 " · ".join(auto_exits),
             )
 
-        nav_options = ["Dashboard", "New trade", "Risk / reward", "Expenses", "History", "Settings"]
+        nav_options = ["Dashboard", "New trade", "Expenses", "History", "Settings"]
         if "nav_tab" in st.session_state:
             st.session_state["nav_tab_radio"] = st.session_state.pop("nav_tab")
         tab = st.sidebar.radio(
@@ -1791,8 +1793,7 @@ def main() -> None:
             page_dashboard(conn, starting, trades_df)
         elif tab == "New trade":
             page_new_trade(conn, starting, trades_df, cs)
-        elif tab == "Risk / reward":
-            page_risk_reward()
+
         elif tab == "Expenses":
             positions = compute_positions(trades_df)
             _, _, holdings_value, _ = _build_open_position_rows(positions, trades_df)
